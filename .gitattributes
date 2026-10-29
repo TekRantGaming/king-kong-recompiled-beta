@@ -1,0 +1,15 @@
+docs/ export-ignore
+.github/ export-ignore
+tools/make_banner.ps1 export-ignore
+tools/make_docs_images.ps1 export-ignore
+tools/click_window.ps1 export-ignore
+tools/send_keys.ps1 export-ignore
+tools/snap_window.ps1 export-ignore
+tools/scroll_window.ps1 export-ignore
+tools/run_to_ship.ps1 export-ignore
+tools/time_opening.ps1 export-ignore
+tools/build_appimage.sh text eol=lf
+tools/build_ffmpeg_linux.sh text eol=lf
+tools/build_linux_beta.sh text eol=lf
+tools/linux_headless_run.sh text eol=lf
+tools/make_linux_sdk_base.sh text eol=lf

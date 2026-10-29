@@ -1,0 +1,211 @@
+// The game's shaders on the host: every vertex and pixel shader object the
+// D3D library creates, translated (stream 02's kkshaders: the prebuilt pack,
+// else translated and compiled with DXC on first use) and created as an NVRHI
+// shader, with the translator's bindings (vertex inputs by usage, texture and
+// sampler slots, pixel outputs).
+//
+// Shaders are registered when they are created (the CreateVertexShader /
+// CreatePixelShader hooks pass the container the engine handed over, so the
+// microcode hash is the database's, before the library patches vertex
+// fetches). A shader object the hooks did not see is parsed from the object
+// itself at its first draw (its container copy and microcode).
+//
+// Thread-safe: creation comes from loader threads, lookups from the render
+// thread.
+#pragma once
+
+#include <condition_variable>
+#include <future>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include <nvrhi/nvrhi.h>
+
+#include "backend/guest_memory.h"
+#include "kkshaders/cache.h"
+#include "kkshaders/container.h"
+#include "kkshaders/translator.h"
+
+namespace nr {
+
+struct GameShader {
+  kkshaders::ShaderKind kind = kkshaders::ShaderKind::Pixel;
+  uint64_t ucode_hash = 0;
+  uint64_t input_hash = 0;  // kkshaders::translationInputHash of the translation
+  uint32_t id = 0;  // small unique number, for pipeline keys
+  kkshaders::ShaderBindings bindings;
+  nvrhi::ShaderHandle handle;
+  bool from_pack = false;
+  // Pixel shaders: the float constant register of the lighting shaders' flat ambient light
+  // (g_vAmbientColor, from the container's constant table; -1 none). The screen-space GI reads
+  // the frame's ambient light from it (docs/gi.md).
+  int16_t ambient_constant = -1;
+  // Vertex shaders: the parsed container (microcode and fetch table), for rebuilding the
+  // library's patched microcode (kkshaders/vertex_patch.h; the frame log's vs hash).
+  std::shared_ptr<const kkshaders::ShaderInfo> source;
+};
+
+class ShaderLibrary {
+ public:
+  struct Stats {
+    uint64_t created = 0;      // shader objects registered
+    uint64_t from_pack = 0;    // found in the pack
+    uint64_t compiled = 0;     // translated and compiled here
+    uint64_t failed = 0;       // could not be parsed, translated or compiled
+    uint64_t from_object = 0;  // parsed from the object at draw time (hook missed)
+  };
+
+  ShaderLibrary(nvrhi::IDevice* device, const GuestMemory& memory);
+  ~ShaderLibrary();
+
+  // pack: a kkshaders pack for this API (or both); dxc: DXC's folder or
+  // library (empty: the default search). Both optional: without the pack
+  // every shader is compiled, without DXC only the pack's shaders exist.
+  void Initialize(const std::string& pack, const std::string& dxc);
+  // Opens the pack later (before the game creates shaders): false if it does not open (logged).
+  bool OpenPack(const std::string& pack);
+  // Pixel shaders are translated render scale aware (the scaled variants of a pack). Set before
+  // any shader is created.
+  void SetRenderScaleAware(bool aware) { scale_aware_ = aware; }
+  void SetMotionPrewarm(bool enabled) { motion_prewarm_ = enabled; }
+  // Ambient-only AO (docs/ao.md): pixel shaders on this list are translated with their ambient term
+  // multiplied by the occlusion (they are not in the pack: DXC compiles them). Set before any shader
+  // is created; null: none.
+  void SetAmbientOcclusion(std::shared_ptr<const kkshaders::AmbientTable> table) { ambient_ = std::move(table); }
+  // The lighting options (docs/lighting.md): pixel shaders drawn with a shader of the renderer's own in
+  // place of their translation (the soft shadows' psshadowquad). Keyed by microcode hash; the blob is
+  // for this device's API and keeps the translation's bindings; 	ag makes its input hash (and so its
+  // pipelines) distinct. Set before any shader is created.
+  struct Replacement {
+    const void* data = nullptr;
+    size_t size = 0;
+    uint64_t tag = 0;
+  };
+  void SetReplacements(std::unordered_map<uint64_t, Replacement> replacements) { replacements_ = std::move(replacements); }
+  // The lighting options' water reflections: the game's water shaders are translated with the reflection hook
+  // (kkshaders/lighting.h; the pack holds them when it was built for the setting). Set before any shader is created.
+  void SetWaterReflections(bool on) { water_reflections_ = on; }
+  // Live lighting variants. Returns null while a worker prepares the shader; the original stays usable.
+  std::shared_ptr<const GameShader> LightingVariant(const GameShader& base, Replacement replacement, bool water);
+  // Live lighting variants still being made (the graphics panel's "Preparing").
+  bool lighting_variants_pending();
+
+  // A shader was created: kind 0 vertex, 1 pixel.
+  void OnCreated(uint32_t kind, uint32_t container, uint32_t object);
+  // Task 183: told about each shader the game creates once it is built (on the game's thread, without the
+  // library's lock): the game renderer makes its graphics pipeline library part ahead of the draws.
+  using BuiltCallback = std::function<void(kkshaders::ShaderKind kind, const std::shared_ptr<const GameShader>& shader)>;
+  void SetBuiltCallback(BuiltCallback callback) {
+    std::lock_guard lock(mutex_);
+    built_callback_ = std::move(callback);
+  }
+  // The shader with this microcode hash (the key the library keeps them under): one already
+  // made, else one built from the pack alone (no container needed). Null when neither exists
+  // (a shader that DXC would translate waits for the game to create it). For the pipeline
+  // prewarm, which knows shaders only by hash.
+  std::shared_ptr<const GameShader> GetByHash(kkshaders::ShaderKind kind, uint64_t ucode_hash, uint64_t input_hash);
+  // A list's exact translation, adapted to this run after its container was registered.
+  std::shared_ptr<const GameShader> GetForPrewarm(kkshaders::ShaderKind kind, uint64_t ucode_hash,
+                                               uint64_t input_hash, bool exact_kind);
+  // Number of shader objects registered so far (changes when the game creates one).
+  uint64_t created_count() const;
+  // The shader for a bound object (null when it cannot be made).
+  std::shared_ptr<const GameShader> Get(kkshaders::ShaderKind kind, uint32_t object);
+
+  Stats stats() const;
+  bool pack_open() const { return pack_open_; }
+
+  // Upscalers (docs/upscalers.md): the motion variant of a vertex shader (its body run with this
+  // frame's and last frame's constants, kkshaders::makeMotionVertexShader). Prepared packs provide
+  // it immediately, including before guest containers exist. Legacy/missing entries compile on
+  // a thread of their own. Null until ready or when unavailable; never waits on DXC.
+  nvrhi::IShader* MotionVariant(const GameShader& vs);
+  struct TessStages {
+    nvrhi::ShaderHandle vs, hs, ds;
+    explicit operator bool() const { return vs && hs && ds; }
+  };
+  // Pack only: never invokes DXC during play. Missing stages keep the draw original.
+  TessStages AnnTessellationStages(uint64_t hash, uint64_t input, bool motion);
+  // Blocks until every motion variant asked for so far is made or failed (tests).
+  void WaitForMotionVariants();
+  struct MotionStats {
+    uint64_t requested = 0, made = 0, failed = 0;
+    double compile_ms = 0;
+  };
+  MotionStats motion_stats() const;
+
+ private:
+  std::shared_ptr<GameShader> Build(const kkshaders::ShaderInfo& info);
+  // The common tail: the host shader from a compiled blob, registered under (kind, hash).
+  std::shared_ptr<GameShader> Finish(kkshaders::ShaderKind kind, uint64_t hash, uint64_t input_hash,
+                                     kkshaders::CompiledShader&& compiled,
+                                     bool from_pack);
+  std::shared_ptr<GameShader> FromObject(kkshaders::ShaderKind kind, uint32_t object);
+
+  nvrhi::IDevice* device_;
+  const GuestMemory& memory_;
+  kkshaders::ShaderPack pack_;
+  bool pack_open_ = false;
+  std::unique_ptr<kkshaders::Compiler> compiler_;
+  bool dxc_ok_ = false;
+  bool scale_aware_ = false;
+  bool motion_prewarm_ = false;
+  std::shared_ptr<const kkshaders::AmbientTable> ambient_;
+  std::unordered_map<uint64_t, Replacement> replacements_;
+  bool water_reflections_ = false;
+  void ApplyLighting(kkshaders::ShaderInfo& info) const {
+    if (water_reflections_ && info.kind == kkshaders::ShaderKind::Pixel) info.waterReflection = kkshaders::waterReflectionHookFor(info.ucodeHash);
+  }
+  const Replacement* FindReplacement(const kkshaders::ShaderInfo& info) const {
+    if (info.kind != kkshaders::ShaderKind::Pixel) return nullptr;
+    auto it = replacements_.find(info.ucodeHash);
+    return it == replacements_.end() ? nullptr : &it->second;
+  }
+  // The ambient-only term of a pixel shader, if it is on the list.
+  void ApplyAmbient(kkshaders::ShaderInfo& info) const {
+    if (!ambient_ || info.kind != kkshaders::ShaderKind::Pixel) return;
+    if (const kkshaders::AmbientTerm* t = ambient_->find(info.ucodeHash)) info.ambientOcclusion = *t;
+  }
+
+  mutable std::mutex mutex_;
+  BuiltCallback built_callback_;  // task 183 (mutex_)
+  // Object address -> shader (addresses are reused after a release; a new
+  // creation replaces the entry).
+  std::unordered_map<uint32_t, std::shared_ptr<GameShader>> by_object_;
+  // (microcode hash, kind) -> shader: one host shader per distinct microcode.
+  std::unordered_map<uint64_t, std::shared_ptr<GameShader>> by_hash_;
+  std::unordered_map<uint64_t, uint64_t> prewarm_inputs_;
+  std::unordered_map<uint64_t, bool> failed_;
+  uint32_t next_id_ = 1;
+  Stats stats_;
+
+  // Motion variants: key -> shader (null while it is made or when it failed), the queue, the thread.
+  void MotionWorker();
+  struct MotionEntry {
+    nvrhi::ShaderHandle handle;
+    bool done = false;
+  };
+  mutable std::mutex motion_mutex_;
+  std::condition_variable motion_cv_;
+  std::unordered_map<uint64_t, MotionEntry> motion_;
+  std::vector<std::pair<uint64_t, std::shared_ptr<const kkshaders::ShaderInfo>>> motion_queue_;
+  std::thread motion_thread_;
+  bool motion_stop_ = false;
+  std::mutex tess_mutex_;
+  std::unordered_map<uint64_t,TessStages> tess_stages_;
+  MotionStats motion_stats_;
+  struct LightingEntry {
+    std::future<std::shared_ptr<GameShader>> build;
+    std::shared_ptr<GameShader> shader;
+  };
+  std::mutex lighting_mutex_;
+  std::unordered_map<uint64_t, LightingEntry> lighting_variants_;
+};
+
+}  // namespace nr

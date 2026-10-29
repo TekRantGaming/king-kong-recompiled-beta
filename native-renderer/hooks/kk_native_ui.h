@@ -1,0 +1,50 @@
+// The game's side of the native renderer's launcher prewarm and stutter counter: compiled into
+// king_kong (kk/CMakeLists.txt, always native) like kk_native_hooks.cpp. Each function
+// looks for the plugin the launcher preloaded and does nothing when it is not there; the plugin
+// decides from its own options whether to do anything (docs/backend.md, "Prewarm from the
+// launcher", "Stutter counter").
+#pragma once
+
+namespace nr::kk {
+void SetStartupFailureHandler(int (*handler)(const char*));
+// Called once, when the game's first frame has been shown.
+void SetStartupPresentedHandler(void (*handler)());
+// Task 297: milliseconds the renderer has spent compiling shaders the game waited for (no shader pack:
+// DXC on the game thread); 0 without the plugin or with a pack. Only differences mean anything.
+unsigned long long ShaderCompileMilliseconds();
+}
+
+#include <filesystem>
+#include <string>
+#include "plugin/native_effect_stats.h"
+
+namespace nr::kk {
+
+// The launcher opened: with --native_launcher_prewarm the plugin starts making the game's pipelines
+// (`cache_root` is the one the game will run with).
+void StartLauncherPrewarm(const std::filesystem::path& cache_root);
+// The launcher quits or restarts the program without playing: stop it (Play needs nothing, the
+// game's start stops it).
+void StopLauncherPrewarm();
+// The launcher's Display > Upscaling menu: which temporal upscalers this PC runs with the backend the
+// game will use (plugin/native_upscaler_query.h). The first call starts the question on a thread of the
+// plugin's; state 2 once the answer is in, 1 meanwhile, 0 or 3 when there is none (no native plugin,
+// no Direct3D 12, no device): then none is offered.
+struct UpscalerChoices {
+  int state = 0;
+  bool fsr3 = false, fsr4 = false, dlss = false, xess = false;
+};
+UpscalerChoices QueryUpscalers();
+// Returns once the question started by QueryUpscalers is answered (at once when it was never started or the
+// plugin kept the answer): task 335, the launcher asks before its window and presentation exist.
+void WaitForUpscalers();
+// The same answer without asking the question (the graphics panel, while the game's device exists): state 0
+// when the launcher did not ask it in this process.
+UpscalerChoices PeekUpscalers();
+// The overlay's line under the frame counter; empty when --native_stutter_stats is off or the native
+// renderer is not drawing.
+std::string StutterLine();
+// The graphics panel's readout (plugin/native_effect_stats.h): size 0 when the native renderer is not drawing.
+NrEffectStats EffectTimes();
+
+}  // namespace nr::kk

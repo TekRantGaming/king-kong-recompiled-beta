@@ -1,0 +1,793 @@
+// rexgpu-native plugin entry points.
+//
+// The runtime loads rexgpu-native.dll when the gpu_plugin cvar is "native"
+// (--gpu_plugin=native) and asks for a graphics system through rex_gpu_create.
+// nr_get_api is the second export: the D3D hooks compiled into king_kong.exe
+// (native-renderer/hooks) use it to reach the backend (native_api.h).
+
+#include <filesystem>
+#include "backend/chapter_texture_prepare.h"
+#include <string_view>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <rex/system/gpu_plugin.h>
+
+#include "backend/backend.h"
+#include "backend/background_file_writer.h"
+#include "backend/compile_clock.h"
+#include "backend/pipeline_exit_gate.h"
+#include "plugin/launcher_prewarm.h"
+#include "plugin/native_api.h"
+#include "plugin/native_startup.h"
+#include "plugin/native_graphics_system.h"
+#include "plugin/native_prewarm.h"
+#include "plugin/native_stutter.h"
+#include "plugin/native_effect_stats.h"
+#include "plugin/native_benchmark_stats.h"
+#include "plugin/upscaler_query.h"
+#if defined(KK_DEV_TOOLS)
+#include "backend/puppet_mesh_probe.h"
+#endif
+
+// Shared graphics settings are owned here; the emulation plugin is never loaded.
+REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_STRING(swap_post_effect, "fxaa", "GPU", "Anti-aliasing: none, fxaa, smaa (SMAA 1x), fxaa_extreme")
+    .allowed({"none", "fxaa", "smaa", "fxaa_extreme"});
+REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU", "Texture filtering override (-1 = game default)").range(-1, 5);
+REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X").range(1, 8);
+REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y").range(1, 8);
+REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU", "Draw resolution scale").range(1, 8);
+REXCVAR_DEFINE_INT32(ao_mode, 0, "GPU", "Ambient occlusion: 0 off, 1 on, 2 AO only").range(0, 2);
+REXCVAR_DEFINE_INT32(ao_strength, 3, "GPU", "Ambient occlusion strength: 1 Light, 2 Medium, 3 Strong").range(1, 3);
+
+REXCVAR_DEFINE_STRING(native_backend, "auto", "Native renderer",
+                      "Host API for the native renderer: auto, d3d12 or vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_test, "triangle", "Native renderer",
+                      "Test picture shown when the game's draws are not routed to the native "
+                      "renderer: clear (a colour that changes each frame) or triangle")
+    .allowed({"clear", "triangle"})
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_draws, true, "Native renderer",
+                    "Draw the game's DrawIndexedVertices / DrawVertices calls through the "
+                    "placeholder pipeline (needs the hooks built into the game)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_validation, false, "Native renderer",
+                    "Wrap the NVRHI device in NVRHI's validation layer (slow; for debugging)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// Task 300/304: D3D12 allocation cost. On by default (owner, 19 Oct). Vulkan ignores both.
+REXCVAR_DEFINE_BOOL(native_d3d12_placed_textures, true, "Native renderer",
+                    "D3D12: place sampled-only textures in pooled 64 MiB heaps instead of one committed resource "
+                    "each (task 300; about 10x less CPU per texture made or released; false = before task 300)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_d3d12_upload_chunk_kib, 4096, "Native renderer",
+                     "D3D12: smallest upload buffer chunk in KiB, made without OS zeroing (task 300; 0 = NVRHI's "
+                     "64 KiB, so every larger texture upload made a new upload buffer: before task 300)")
+    .range(0, 65536).lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// Task 309: on by default (owner, 19 Oct). Vulkan ignores it.
+REXCVAR_DEFINE_BOOL(native_d3d12_buffer_pool, true, "Native renderer",
+                    "D3D12: guest vertex and index buffers share large 32 MiB buffers instead of one committed "
+                    "resource each (task 309; false = before task 309)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// Task 313: Vulkan allocation cost. Both on by default (owner, 19 Oct).
+REXCVAR_DEFINE_BOOL(native_vk_texture_pool, true, "Native renderer",
+                    "Vulkan: guest textures share 64 MiB device memory blocks instead of one vkAllocateMemory each "
+                    "(task 313; false = before task 313)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_vk_buffer_pool, true, "Native renderer",
+                    "Vulkan: guest vertex and index buffers share 32 MiB buffers instead of one allocation each "
+                    "(task 313; false = before task 313)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_wvp_transpose, false, "Native renderer",
+                    "Placeholder draws: read vertex shader constants c0..c3 as the columns of "
+                    "the world-view-projection matrix instead of its rows")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_all_targets, false, "Native renderer",
+                    "Placeholder draws: also draw render-to-texture passes into the frame")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_main_pass_only, true, "Native renderer",
+                    "Placeholder draws: draw only depth-tested draws that write depth or are opaque "
+                    "(the main pass); off also draws full-screen passes, particles and the HUD, "
+                    "which cover the frame")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_game, true, "Native renderer",
+                    "Draw the game with its own shaders, textures and states (Phase 2); off: the "
+                    "milestone 3 placeholder pipeline (flat-coloured silhouettes)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_shader_pack, "", "Native renderer",
+                      "The translated shader pack. Empty: kkshaders-spirv.pack (Vulkan) or "
+                      "kkshaders-dxil.pack (D3D12) in <cache root>/native-shaders, where the launcher "
+                      "builds it from the game's files, else beside the game (kkshaders db-build), else "
+                      "every shader is compiled with DXC on first use")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_dxc, "", "Native renderer",
+                      "DXC (dxcompiler) folder or library, for shaders missing from the pack. Empty: "
+                      "beside the game, then the system's search path")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_element_endian, true, "Native renderer",
+                    "Read each vertex element with its declaration's endian field (on: what the "
+                    "game's frames need) instead of the vertex buffer's")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_async_pipelines, true, "Native renderer",
+                    "Vulkan: create pipelines on a worker thread and skip a draw until its pipeline "
+                    "is ready, instead of stalling the game for the driver's compile")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_pipeline_cache, true, "Native renderer",
+                    "Record every pipeline description the game's draws need to a file under the cache root "
+                    "and create them all on the worker threads at the next start, so the first visit to a "
+                    "level does not stall for the driver's compile (Vulkan; needs native_async_pipelines)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_pipeline_cache_dir, "", "Native renderer",
+                      "Folder for the pipeline cache file when native_pipeline_cache is on. Empty: "
+                      "<cache root>/native-pipelines")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_failed_backends, "", "Native renderer",
+                      "Set by the game's startup recovery: the graphics APIs (vulkan, d3d12, comma separated) that "
+                      "failed to start on this PC. Setup does not prepare shaders or pipelines for them")
+    .debug_only();
+
+// Task 368: the game turns this on (as a default, never saved) on Intel integrated graphics, where Intel's
+// Direct3D 12 driver crashed while the setup made a device for that API's pipelines.
+REXCVAR_DEFINE_BOOL(native_setup_skip_d3d12, false, "Native renderer",
+                    "Setup does not build the Direct3D 12 shader pack or prepare its pipelines unless Direct3D 12 "
+                    "is the selected API (set by the game on Intel integrated graphics)")
+    .debug_only();
+
+REXCVAR_DEFINE_BOOL(native_vk_pipeline_cache, true, "Native renderer",
+                    "Vulkan: keep the driver's compiled pipelines (a VkPipelineCache) in a file under the cache "
+                    "root (<cache root>/native-pipelines/<title>.vkcache, or native_pipeline_cache_dir) and load it "
+                    "at start, so making the pipelines again is fast. A file another GPU, driver or driver version "
+                    "made is not used: the cache is rebuilt in the background and the file replaced")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_launcher_prewarm, false, "Native renderer",
+                    "When the launcher opens, make the game's known pipelines (native_pipeline_cache's file and the "
+                    "shipped list) on a Vulkan device of the plugin's own while the player is still there. The driver "
+                    "keeps what it compiled (its own disk cache, and native_vk_pipeline_cache's file), so the game's "
+                    "start makes them again quickly. Stopped when the game starts")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_stutter_stats, false, "Native renderer",
+                    "Pipeline stutter counter: frames in which a draw waited for its pipeline or was skipped "
+                    "because it was not ready, and the worst wait, in the log (every 300 swaps and at the end) and "
+                    "with the performance metrics (kk_performance_metrics, F2)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_diagnostics, false, "Native renderer",
+                    "Collect detailed native renderer call timings, slowest frames and ring telemetry")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_pipeline_list, true, "Native renderer",
+                    "Load the pipeline list shipped beside the game (kkpipelines.list, made by nr_pipelines merge "
+                    "from the pipeline cache files of several runs) at start and create its pipelines on the "
+                    "worker threads, so a fresh install draws everything from its first frame (needs "
+                    "native_async_pipelines; without the file nothing is loaded). The list is never written")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_pipeline_list_file, "", "Native renderer",
+                      "The shipped pipeline list when native_pipeline_list is on. Empty: kkpipelines.list beside "
+                      "the game")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_pipeline_wait, false, "Native renderer",
+                    "Every draw whose pipeline is still being created waits for it (true; the frame freezes "
+                    "while the driver compiles). False (task 179): a scene draw is skipped for a frame or two "
+                    "until its pipeline is ready; draws later draws depend on (depth/stencil-only, screen-space "
+                    "passes and fades, frames while loading) still wait. KK_DEV_PIPELINE_BLOCK=1 = true. Only "
+                    "with native_async_pipelines")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_dynamic_vertex_buffers, true, "Native renderer",
+                    "Vertex buffers the game rewrites every frame are not watched for writes: each draw "
+                    "uploads the vertices it reads (no write fault per page and frame)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_render_thread, true, "Native renderer",
+                    "Draw on a thread of the renderer's own, as the Xenos plugin's command processor does: "
+                    "the game's thread only copies each call's state, and the guest GPU's fences wait for "
+                    "the renderer (the game's timing then follows the Xenos plugin's)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_render_thread_fences, true, "Native renderer",
+                    "With native_render_thread: the guest GPU's fences, swaps and interrupts wait until the render "
+                    "thread has run the calls queued before them (false: they pass at once, as without the render "
+                    "thread; for testing)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(native_render_thread_presents, 1, "Native renderer",
+                     "With native_render_thread: how many frames the game may queue ahead of the render thread "
+                     "before its Present waits (1 to 4)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_frame_wait, "submit", "Native renderer",
+                      "Where the renderer keeps the GPU at most two frames behind: submit (wait for frame N-2 "
+                      "just before frame N is submitted, so frame N is recorded meanwhile) or open (wait before "
+                      "frame N is recorded, the first Beta 4 candidate's behaviour)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_async_present, true, "Native renderer",
+                    "Hand each frame to the presenter from a thread of its own, so the guest GPU's command "
+                    "stream (and the game waiting on it) does not wait for the presenter")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_async_submit, true, "Native renderer",
+                    "Submit each frame's GPU work from a thread of its own, so the game's thread does not "
+                    "wait for the queue while the presenter holds it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_vk_pipeline_library, true, "Native renderer",
+                    "Vulkan: link a game pipeline the renderer has not made yet from cached graphics pipeline library "
+                    "parts (VK_EXT_graphics_pipeline_library) in microseconds, then compile it whole in the background "
+                    "and use that from then on. Off, or a driver without the extension: every pipeline is compiled "
+                    "whole (KK_DEV_NO_GPL=1 turns it off too)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_present_unlocked, true, "Native renderer",
+                    "Hand the game's frame to the presenter without holding the renderer's lock, so the "
+                    "game's draws do not wait while the presenter waits for its previous paint")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_pipeline_wait_budget_ms, 4.0, "Native renderer",
+                      "Without native_pipeline_wait: milliseconds a frame may wait in all for scene draws' "
+                      "pipelines being created before those draws are skipped (0: skip at once, never wait)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_DOUBLE(native_pipeline_must_wait_ms, 4.0, "Native renderer",
+                      "Without native_pipeline_wait: milliseconds a gameplay frame may wait in all for the pipelines "
+                      "of draws later draws depend on (depth-only, stencil, screen-space) before those are skipped "
+                      "too (task 267; -1: no limit, the old behaviour)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Task 280: 256 MiB preload + 8 MiB/frame trickle, on by default (owner, 19 Oct; REPORT-280: chapter-start
+// texture time e.g. entry 8 D3D12 111 -> 46 ms over frames 1-10). 64 / 0 = before task 280.
+REXCVAR_DEFINE_INT32(native_chapter_preload_mib, 256, "Native renderer",
+                     "MiB of a chapter's listed textures and buffers prepared before their first draw, on the loading "
+                     "screen and in the trickle (task 280; 64 = before task 280; GPU memory pressure keeps 64)")
+    .range(64, 1024).lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_chapter_trickle_mib, 8, "Native renderer",
+                     "After a loading screen, MiB per frame of the chapter's listed resources not yet on the GPU "
+                     "prepared ahead of their first draw, for 10 s (task 280; 0 = off, before task 280)")
+    .range(0, 32).lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Task 276/279: level_first on by default (owner, 19 Oct). native_pipeline_play_workers stays 0 until it is tested
+// on a slow CPU (owner, 19 Oct).
+REXCVAR_DEFINE_BOOL(native_pipeline_level_first, true, "Native renderer",
+                    "When a level loads, prepare the listed pipelines tagged with that level before the rest of "
+                    "the list (task 276; false: list order). New pipelines are tagged with their level either way")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(native_pipeline_play_workers, 0, "Native renderer",
+                     "Background pipeline preparation jobs at once while a level is played (task 276): 0 = no "
+                     "limit (as in menus and loading), N = at most N, -1 = auto (PCs with 8 or fewer cores keep a "
+                     "third of the workers). Draws' own pipelines always use every worker")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Task 284: built with today's behaviour (owner rule). Proposed for Craig: native_texture_pack_event_scan
+// true; native_texture_pack_reduce_mips stays false.
+REXCVAR_DEFINE_BOOL(native_texture_pack_event_scan, false, "Native renderer",
+                    "Texture pack: look through the textures waiting for a replacement only when the pack reader "
+                    "finished a batch or a texture's pack state changed, at least every 60 frames (task 284; "
+                    "false = every frame, before task 284)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_texture_pack_reduce_mips, false, "Native renderer",
+                    "Texture pack: a replacement larger than the free pack memory leaves out its most detailed mips "
+                    "until it fits (never below the original size) instead of keeping the original (task 284)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_render_scale, "auto", "Native renderer",
+                      "Render scale: the game's render targets, viewports, resolves and textures made from "
+                      "them are this many times the 360's 1280x720 (1 = the 360's size; 1.5, 2, 3, any number "
+                      "from 0.25 to 8), or a frame size such as 1920x1080. The frame handed to the presenter "
+                      "is the scaled one; its upscalers and FXAA still apply. Above 1 the pixel shaders are "
+                      "the render scale aware ones: build the pack with kkshaders db-build --also-scaled, "
+                      "else they are compiled at startup (needs DXC). auto: the port's draw resolution scale "
+                      "(draw_resolution_scale_x / _y, which the launcher's render quality presets set, or "
+                      "resolution_scale), as the Xenos plugin uses it (the default; 1 = the old default); the game "
+                      "caps it at the chosen resolution (native_upscaler_output / native_frame_size)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_shadow_scale, 0.0, "Native renderer",
+                      "Render scale of the shadow maps (k_32_FLOAT targets that are not the frame's size, "
+                      "832x832 in the game). 0: like native_render_scale; 1: keep them at the 360's size")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// Ambient occlusion beyond the launcher's ao_mode and ao_strength (docs/ao.md). The defaults are
+// today's AO.
+REXCVAR_DEFINE_STRING(native_ao_method, "legacy", "Native renderer",
+                      "Ambient occlusion method: legacy (the occlusion ported from the Xenos plugin) or gtao "
+                      "(XeGTAO from the scene's depth). ao_mode and ao_strength still turn it on and set its strength")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_ao_apply, "resolve", "Native renderer",
+                      "When the gtao method's occlusion reaches the picture: resolve (at the scene copy after the "
+                      "depth resolve, today's moment), opaque (at the end of the opaque pass, before water, smoke, "
+                      "particles and fog), ambient (inside the lighting shaders of native_ao_shaders, opaque "
+                      "otherwise). The legacy method always uses resolve")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_ao_quality, "auto", "Native renderer",
+                      "The gtao method's resolution: full or half (of the scene target, at the render scale), "
+                      "or auto (full up to a render scale of 1.5, half above)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(native_ao_temporal, true, "Native renderer",
+                    "GTAO noise smoothing: blend each pixel's occlusion with last frame's (or let the temporal "
+                    "upscaler do it). Off shows the raw, grainier occlusion. Applied live");
+REXCVAR_DEFINE_INT32(native_ao_samples, 2, "Native renderer",
+                     "GTAO sample quality: 1 low (2 slices x 2 steps), 2 medium (3 x 3, the previous setting), "
+                     "3 high (9 x 3). Applied live, independently of native_ao_quality's resolution");
+REXCVAR_DEFINE_INT32(native_ao_normal_smoothing, 0, "Native renderer",
+                     "GTAO normal smoothing: 0 off, 1 low, 2 high. The normals rebuilt from depth are flat per "
+                     "triangle, so low-poly models get faceted occlusion; this blurs them across each surface "
+                     "(silhouettes and right-angle edges stay sharp). Applied live");
+
+REXCVAR_DEFINE_DOUBLE(native_ao_radius, 0.0, "Native renderer",
+                      "The gtao method's occlusion radius in the game's world units; 0: from the camera (the "
+                      "legacy method's radius for the strength, in near-plane distances)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_ao_rules, "", "Native renderer",
+                      "A file of draw classifier rules placed before the built-in ones (docs/ao.md)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_ao_shaders, "", "Native renderer",
+                      "The ambient-only mode's list of lighting pixel shaders and their ambient term (docs/ao.md)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_ao_radius_scale, 1.0, "Native renderer",
+                      "The gtao method's radius from the camera times this (tuning, docs/ao.md)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_ao_falloff, 0.0, "Native renderer",
+                      "The gtao method's falloff range, 0 to 1 of the radius (0: XeGTAO's 0.615)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_ao_power, 0.0, "Native renderer",
+                      "The gtao method's final power (0: from ao_strength)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_ao_fade, 0.0, "Native renderer",
+                      "The gtao method's occlusion fades out linearly to this many near-plane distances (0: none)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(native_ao_dump_every, 0, "Native renderer",
+                     "Every this many frames, log the AO classifier's view of each draw (0: off)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_ao_gpu_time, false, "Native renderer",
+                    "Time the ambient occlusion's GPU passes and log the average every 600 frames")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// Screen-space global illumination (docs/gi.md). Off by default; the launcher's Graphics page sets
+// native_gi ("Global illumination").
+REXCVAR_DEFINE_BOOL(native_tessellation, false, "Native renderer", "Experimental Ann Phong tessellation for supported material parts")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(native_tessellation_smoothness, 0.75, "Native renderer", "Ann tessellation smoothness, 0 to 1")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(native_tessellation_detail, 4, "Native renderer", "Ann tessellation detail, 1 to 16")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Cel shading (docs/cel.md): ink outlines and flat colour bands on the 3D scene. Off by default; the
+// Original look keeps it off. All live (the F8 panel's "Cel shading").
+REXCVAR_DEFINE_BOOL(native_cel_shading, false, "Native renderer",
+                    "Cel shading: ink outlines and flat colour bands on the 3D scene (before water, smoke, fog and "
+                    "the HUD; docs/cel.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(native_cel_outline, 1.5, "Native renderer",
+                      "Cel shading: outline thickness in pixels of a 1080-line picture (scaled with the resolution; "
+                      "0 no outlines)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(native_cel_darkness, 0.8, "Native renderer", "Cel shading: outline darkness, 0 to 1 (1 black)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(native_cel_bands, 3, "Native renderer", "Cel shading: flat light bands, 2 to 4")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(native_cel_strength, 0.6, "Native renderer",
+                      "Cel shading: how flat the bands are, 0 (the original shading) to 1")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(native_cel_debug, 0, "Native renderer", "Cel shading: 1 shows the outlines alone on white, 2 depth lines cyan and creases magenta (testing)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(native_cel_gpu_time, false, "Native renderer",
+                    "Cel shading: log its GPU time (timer queries, averaged every 600 frames)");
+
+REXCVAR_DEFINE_STRING(native_gi, "off", "Native renderer",
+                      "Screen-space global illumination (one bounce of light from the surfaces on the screen, "
+                      "added at the end of the opaque pass): off, low, medium or high")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_gi_distance, "medium", "Native renderer",
+                      "GI camera distance: near (16 m), medium (32 m), far (64 m), full (unlimited); final quarter fades")
+    .allowed({"near", "medium", "far", "full"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_gi_intensity, 1.0, "Native renderer",
+                      "Global illumination strength (1: normal calibrated bounce, 4: strong)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_gi_quality, "auto", "Native renderer",
+                      "The global illumination's working resolution: auto (low and medium half, high full up to a "
+                      "render scale of 1.5), half or full")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_gi_radius, 0.0, "Native renderer",
+                      "How far the global illumination gathers light from, in world units (0: the level's)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_gi_thickness, 0.0, "Native renderer",
+                      "How deep the global illumination takes a surface on the screen to be, in world units (0: a "
+                      "fifth of the radius, 0.25 to 1)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_gi_albedo, 0.75, "Native renderer",
+                      "The brightest surface colour the global illumination's composite assumes (0.05 to 1)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(native_gi_occlusion, 0.0, "Native renderer",
+                      "With ambient occlusion off: how much of the flat ambient light the global illumination "
+                      "takes away where surfaces hide the sky (0 to 1)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(native_gi_debug, 0, "Native renderer",
+                     "Global illumination debug view: 0 off, 1 the bounce light alone, 2 the change on grey, 3 the "
+                     "visibility")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_gi_temporal, true, "Native renderer",
+                    "Global illumination: blend in last frame's light where the camera saw the same surface (the "
+                    "camera's motion voted from the scene's draws)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_gi_gpu_time, false, "Native renderer",
+                    "Time the global illumination's GPU passes and log the average every 600 frames")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// Temporal upscalers (docs/upscalers.md). Off by default: nothing of them runs.
+REXCVAR_DEFINE_STRING(native_upscaler, "auto", "Native renderer",
+                      "Temporal upscaler: off, auto (DLSS on NVIDIA RTX, FSR 4 on supported AMD, XeSS on Intel, "
+                      "FSR 3.1 otherwise), fsr3, fsr4, dlss, xess (bilinear: a plain stretch, for comparisons). "
+                      "The output is native_render_scale's size (auto: the resolution chosen in the launcher). "
+                      "auto until the game sets its own default (the "
+                      "best one this PC runs) once its settings are read. Applied live with its mode, DLSS preset, "
+                      "sharpness, mip bias and reactive mask: the upscaler is made again at a frame boundary")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_upscaler_quality, "quality", "Native renderer",
+                      "The upscaler's mode: native (anti-aliasing at the output resolution: DLAA, FSR native AA, "
+                      "XeSS native AA), quality, balanced, performance, ultra_performance")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_upscaler_output, "", "Native renderer",
+                      "With an upscaler and native_render_scale auto: the upscaler's output size, WxH. The game "
+                      "sets it (not saved) to the resolution chosen in the launcher as a 16:9 picture, never above "
+                      "it; empty: the draw resolution scale's size")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_display_aspect, "", "Native renderer",
+                      "The shown picture's shape, WxH (the game sets it, not saved, on a screen wider "
+                      "than 16:9: ultrawide); empty: the game's own 16:9")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_frame_size, "", "Native renderer",
+                      "Without an upscaler and native_render_scale auto: the frame size, WxH. The game sets it "
+                      "(not saved) to the draw resolution scale's size, never above the resolution chosen in the "
+                      "launcher (its 16:9 picture); empty: the draw resolution scale's size")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_upscaler_point, "post", "Native renderer",
+                      "Where the upscaler runs: post (before the game's post effects and HUD) or present (at the "
+                      "end of the frame, everything upscaled)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_upscaler_dlss_preset, "latest", "Native renderer",
+                      "DLSS's render preset: latest (the newest model: DLSS 4.5's M, L for ultra performance), "
+                      "default (the DLL's choice per mode), J or K (DLSS 4 transformer), L or M (DLSS 4.5)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_upscaler_sharpness, -1.0, "Native renderer",
+                      "Sharpening after the upscale, 0 to 1 (FSR's RCAS; DLSS and XeSS have none); negative: off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_upscaler_mip_bias, "auto", "Native renderer",
+                      "Material texture LOD bias: auto (log2 of input over output, minus 1 for DLSS/FSR below "
+                      "output size), or a number")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_upscaler_reactive, 1.0, "Native renderer",
+                      "Strength of the reactive mask (what changed after the opaque pass: water, fur, smoke, rain, "
+                      "particles), 0 to 1; 0: no mask")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(native_upscaler_debug, 0, "Native renderer",
+                     "Upscaler debugging bits: 1 show the motion vectors, 2 the reactive mask, 4 camera motion only, "
+                     "8 no jitter, 16 a log line per frame, 32 show the depth, 64 no mip bias, 128 log the camera vote "
+                     "and the constants that changed, 512 read the motion vectors back every 150 frames and log them, "
+                     "1024 draws on rewritten vertex buffers get the camera's motion only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_upscaler_gpu_time, false, "Native renderer",
+                    "Time the upscaler's GPU work and log the average every 600 frames")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_upscaler_rules, "", "Native renderer",
+                      "A file of upscale point rules: 'post ps=<hash>' starts the post chain, 'scene ps=<hash>' never")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// The lighting options (docs/lighting.md). Every default is the game's own picture; the Original
+// look keeps them there.
+REXCVAR_DEFINE_STRING(native_shadow_quality, "original", "Native renderer",
+                      "Shadows: original (the game's 832x832 shadow maps, hard edges), high (shadow maps at twice "
+                      "the resolution, soft edges from a wide rotated filter) or ultra (1.5 times the resolution, "
+                      "edges that soften with the distance to what casts the shadow). native_shadow_scale, when "
+                      "set, still sets the shadow maps' resolution")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_water_reflections, "original", "Native renderer",
+                      "Water reflections: original (the game's planar reflection and environment colour) or ssr "
+                      "(screen-space reflections of the scene, the game's own where a ray finds nothing)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(native_volumetrics, "off", "Native renderer",
+                      "Light shafts: off (the game's own), low or high (volumetric light from the sun's shadow map "
+                      "added where the game has light shafts or fog)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_shadow_softness, 1.0, "Native renderer",
+                      "The soft shadows' filter size times this (tuning, docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_ssr_strength, 1.0, "Native renderer",
+                      "The water's screen-space reflections' strength times this (tuning, docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_ssr_ripple, 0.25, "Native renderer",
+                      "Smooth water reflections: the share of the wave triangles' tilt the reflections keep "
+                      "(0 a mirror-flat surface, 1 the full waves; docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(native_ssr_smooth, true, "Native renderer",
+                    "Water reflections from the water's flat plane (false: from each wave triangle, the first "
+                    "version; a comparison switch, docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(native_ssr_soft_edge, true, "Native renderer",
+                    "Smooth water reflections: where a ray misses beside something it could hit, fade into the "
+                    "game's own reflection over a few pixels (false: a hard edge; a comparison switch, "
+                    "docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(native_ssr_debug, false, "Native renderer",
+                    "Water reflections developer view: hits red, near passes green, behind thin objects blue "
+                    "(docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(native_volumetric_strength, 1.0, "Native renderer",
+                      "The volumetric light's strength times this (tuning, docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(native_lighting_census, 0, "Native renderer",
+                     "Every this many frames, log the frame's draws with the lighting passes' targets, textures "
+                     "and constants (0: off; docs/lighting.md)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_lighting_gpu_time, false, "Native renderer",
+                    "Time the lighting options' GPU passes and log the averages every 600 frames")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_flip_front_face, false, "Native renderer",
+                    "Swap the front face of every draw (a debugging aid for culling)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_texture_tail_mips, false, "Native renderer",
+                    "Small textures whose whole mip chain sits in the base level's packed tail (bound with "
+                    "mip address 0): read the smaller levels from that tail. Off: level 0 only, as the SDK")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_effect_buffers, true, "Native renderer",
+                    "Scale the game's small bloom, blur and glow buffers with output resolution; false keeps their original size");
+
+REXCVAR_DEFINE_STRING(native_sharpness, "off", "Native renderer",
+                      "FidelityFX CAS after native/FXAA/temporal output: off, low, medium, high. Skipped when upscaler sharpening is active");
+REXCVAR_DEFINE_BOOL(native_texture_pack, false, "Native renderer", "Use replacement textures from your own texture pack")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(native_texture_pack_folder, "", "Native renderer", "Folder containing the texture pack's pack.txt")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(native_debug, 0, "Native renderer",
+                     "Debugging aids (bits): 1 the game's clears are green, 2 the frame image is "
+                       "magenta under the back buffer, 32768 residency/upload/frame GPU counters, "
+                       "524288 GPU pass batches (every fourth frame)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(native_vk_small_tables, false, "Native renderer",
+                    "Force reduced Vulkan descriptor tables for hardware testing")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(native_vk_minimum_tables, false, "Native renderer",
+                    "Force minimum Vulkan descriptor tables and stress GPU-completed recycling")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(native_show_texture, "", "Native renderer",
+                      "Debugging: show the texture a resolve wrote at this guest address (hex, the fetch "
+                      "constant's base) instead of the frame")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_INT32(native_dump_frame, -1, "Native renderer",
+                     "Log every clear, draw, resolve and present the hooks see in this game "
+                     "frame (counted from the first Present; -1 for none)");
+
+REXCVAR_DEFINE_BOOL(native_log_packets, false, "Native renderer",
+                    "Log the GPU packets the ring skimmer sees (very noisy)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
+  return rex::system::kGpuPluginAbiVersion;
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
+    uint32_t abi_version, const rex::system::GpuCreateInfo* info) {
+  if (abi_version != rex::system::kGpuPluginAbiVersion) {
+    REXLOG_ERROR("rexgpu-native: host requested ABI {}, plugin is ABI {}", abi_version,
+                 rex::system::kGpuPluginAbiVersion);
+    return nullptr;
+  }
+  if (!info || info->struct_size < sizeof(rex::system::GpuCreateInfo)) {
+    REXLOG_ERROR("rexgpu-native: invalid GpuCreateInfo");
+    return nullptr;
+  }
+  // The host passes "any"; the native_backend cvar narrows it.
+  std::string_view backend = info->backend ? info->backend : "any";
+  std::string wanted = REXCVAR_GET(native_backend);
+  if (wanted != "auto") {
+    backend = wanted;
+  }
+  auto* system = nr::NativeGraphicsSystem::Create(backend);
+  if (!system) {
+    REXLOG_ERROR("rexgpu-native: no usable host API for backend '{}'", backend);
+    nr::ReportStartupFailure("could not create a supported graphics API");
+  }
+  return system;
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_set_startup_failure_handler(nr::StartupFailureHandler handler) {
+  nr::startup_failure_handler.store(handler, std::memory_order_release);
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_set_startup_presented_handler(nr::StartupPresentedHandler handler) {
+  nr::startup_presented_handler.store(handler, std::memory_order_release);
+}
+
+// Task 297: milliseconds spent compiling shaders the game waited for (backend/compile_clock.h); King
+// Kong leaves them out of its startup limits. 0 with a shader pack.
+extern "C" REX_GPU_PLUGIN_EXPORT uint64_t nr_shader_compile_milliseconds(void) {
+  return nr::CompileClock::Milliseconds();
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT const NrApi* nr_get_api(void) {
+  return nr::NativeGraphicsSystem::GetApi();
+}
+
+#if defined(KK_DEV_TOOLS)
+extern "C" REX_GPU_PLUGIN_EXPORT const NrPuppetProbeApi* nr_get_puppet_probe(void) {
+  return &nr::puppet_probe::api;
+}
+#endif
+
+// Optional creation-only notification, independent of the versioned draw API.
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_texture_preload_object(uint32_t object) {
+  nr::TextureCreationInbox().Push(object);
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_clip_texture_loading(uint32_t level, uint32_t start, uint32_t active) {
+  nr::ChapterTextureClip().store(active ? (uint64_t(level) << 32) | start : 0, std::memory_order_release);
+}
+
+// The launcher's prewarm (native_prewarm.h).
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_prewarm_start(const NrPrewarmRequest* request) {
+  if (!request || request->size < sizeof(NrPrewarmRequest) || request->version != NR_PREWARM_VERSION) {
+    REXLOG_ERROR("rexgpu-native: nr_prewarm_start: a request of another version");
+    return NR_PREWARM_OFF;
+  }
+  const char* root = request->cache_root ? request->cache_root : "";
+  return nr::StartLauncherPrewarm(std::filesystem::path(reinterpret_cast<const char8_t*>(root)), request->title_id);
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_prewarm_status(NrPrewarmStatus* status) {
+  return nr::LauncherPrewarmStatus(status);
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_prewarm_stop(void) { nr::StopLauncherPrewarm(); }
+
+// Task 177: the renderer's cache files are written on a background thread, and the runtime hard-exits
+// (no destructors) when the title ends. The game calls this just before: waits up to `timeout_ms` for
+// queued writes. 1 = everything written.
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_flush_file_writes(uint32_t timeout_ms) {
+  const auto start = std::chrono::steady_clock::now();
+  const bool all = nr::BackgroundFileWriter::FlushAll(std::chrono::milliseconds(timeout_ms));
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  if (!all) {
+    REXLOG_WARN("rexgpu-native: file writes still running after {} ms at exit", timeout_ms);
+  } else if (ms >= 1) {
+    REXLOG_INFO("rexgpu-native: file writes finished before exit ({:.0f} ms)", ms);
+  }
+  return all ? 1u : 0u;
+}
+// Task 233: before a hard exit, or before handing over to a new process of the game: no new background
+// pipeline compile from now on (the workers' jobs are refused), and a bounded wait for the pipeline creations
+// already inside the driver, so none is killed while the driver may be writing its own shader cache. Returns
+// how many were still running when the wait ended (0 = none). One log line per exit.
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_quiesce_pipelines(uint32_t timeout_ms) {
+  const nr::PipelineExitGate::Result r = nr::ExitGate().CloseAndWait(std::chrono::milliseconds(timeout_ms));
+  if (r.first || r.running) {
+    if (r.left) {
+      REXLOG_WARN("rexgpu-native: exit: {} pipeline compiles running, {} still running after {:.0f} ms (limit {} ms)",
+                  r.running, r.left, r.waited_ms, timeout_ms);
+    } else {
+      REXLOG_INFO("rexgpu-native: exit: {} pipeline compiles running, waited {:.0f} ms; no new ones from now on",
+                  r.running, r.waited_ms);
+    }
+  }
+  return r.left;
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_effect_stats(NrEffectStats* stats) {
+#if NR_GAME_RENDERER
+  return nr::ReadEffectStats(stats) ? 1u : 0u;
+#else
+  return 0;
+#endif
+}
+
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_benchmark_stats(NrBenchmarkStats* stats) {
+  return nr::ReadBenchmarkStats(stats) ? 1u : 0u;
+}
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_benchmark_enable(uint32_t enabled) {
+  nr::benchmark_stats_enabled.store(enabled != 0, std::memory_order_relaxed);
+}
+
+// The launcher's upscaler menu (native_upscaler_query.h).
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_upscaler_query(NrUpscalerSupport* out) { return nr::UpscalerQuery(out); }
+
+extern "C" REX_GPU_PLUGIN_EXPORT void nr_upscaler_query_wait(void) { nr::WaitUpscalerQuery(); }
+
+// Task 353: the upscaler check's own process (king_kong.exe --kk_upscaler_check=...; kk/src/main.cpp calls this
+// before anything else of the game runs). Returns the process's exit code.
+extern "C" REX_GPU_PLUGIN_EXPORT int nr_upscaler_check_main(const wchar_t* report, const wchar_t* adapter) {
+#if NR_GAME_RENDERER && NR_HAS_D3D12
+  return nr::UpscalerCheckMain(report, adapter);
+#else
+  (void)report;
+  (void)adapter;
+  return 5;
+#endif
+}
+
+// The graphics panel's view of the same answer: never starts the question (the game's device exists).
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_upscaler_query_peek(NrUpscalerSupport* out) {
+  return nr::UpscalerQueryPeek(out);
+}
+
+// The pipeline stutter counter for the overlay (native_stutter.h).
+extern "C" REX_GPU_PLUGIN_EXPORT uint32_t nr_stutter_stats(NrStutterStats* stats) {
+  nr::StutterSnapshot s;
+  if (!stats || stats->size < sizeof(NrStutterStats) || !nr::ReadStutterSnapshot(&s)) return 0;
+  stats->frames = s.frames;
+  stats->stutter_frames = s.stutter_frames;
+  stats->frames_waited = s.frames_waited;
+  stats->frames_skipped = s.frames_skipped;
+  stats->draws_skipped = s.draws_skipped;
+  stats->worst_wait_frame = s.worst_wait_frame;
+  stats->wait_ms = s.wait_ms;
+  stats->worst_wait_ms = s.worst_wait_ms;
+  return 1;
+}

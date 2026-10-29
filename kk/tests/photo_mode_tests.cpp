@@ -1,0 +1,268 @@
+// Task 208: photo mode's logic without the game or a GPU. The settings it sends the renderer (defaults
+// change nothing, the player's own settings stay in charge until a row is changed), the camera's limits
+// (radius, roll), the controller mapping, the picture names, and the renderer's side: which draws it leaves
+// out (only Jack's arms, never by shader alone) and the photo grade's colour function (the GPU pass does the
+// same, shaders/photo.hlsl).
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <vector>
+
+#include "backend/photo_config.h"
+#include "backend/picture_adjust.h"
+#include "freecam_math.h"
+#include "pause_backdrop_logic.h"
+#include "photo_mode_logic.h"
+
+namespace {
+int failures = 0;
+void Check(bool ok, const char* what) {
+  if (!ok) {
+    ++failures;
+    std::printf("FAIL %s\n", what);
+  }
+}
+bool Near(float a, float b, float e = 1e-4f) { return std::fabs(a - b) <= e; }
+float Luma(const std::array<float, 3>& c) { return c[0] * 0.2126f + c[1] * 0.7152f + c[2] * 0.0722f; }
+}  // namespace
+
+int main() {
+  using namespace kk::photo;
+  // Fresh values: the player's picture settings are the Picture rows' defaults; nothing overrides them.
+  const Values v = Fresh(1, 2, 12.0f, 1.2f, 7);
+  const NrPhotoSettings s = ToRenderer(v, true);
+  Check(s.size == sizeof(NrPhotoSettings), "size");
+  Check(s.active == 1 && s.hide == 3, "active hides the arms and the pause cover");
+  Check(s.cel == -1 && s.sharpness == -1 && std::isnan(s.brightness) && std::isnan(s.gamma),
+        "untouched Picture rows keep the player's settings");
+  Check(!nr::PhotoGradeNeeded(nr::SanitizePhotoSettings(s)), "defaults need no grade pass");
+  Values changed = v;
+  changed.cel = 0;
+  changed.brightness = -5;
+  const NrPhotoSettings c = ToRenderer(changed, true);
+  Check(c.cel == 0 && Near(c.brightness, -5) && c.sharpness == -1, "a changed row overrides only that setting");
+  Values no_arms = v;
+  no_arms.hide_arms = false;
+  Check(ToRenderer(no_arms, true).hide == 2, "arms shown: only the pause cover is left out");
+  Check(ToRenderer(v, false).active == 0 && ToRenderer(v, false).hide == 0, "inactive hides nothing");
+  Values look = v;
+  look.look = 2;
+  look.letterbox = 3;
+  look.dof = 50;
+  const NrPhotoSettings l = ToRenderer(look, true);
+  Check(l.look == 2 && Near(l.letterbox, 2.39f) && Near(l.dof, 0.5f), "look, letterbox and depth of field");
+  Check(nr::PhotoGradeNeeded(nr::SanitizePhotoSettings(l)), "a look needs the grade pass");
+  // Task 213 (Beta 9 "amber tint"): outside photo mode the picture is the game's own. The renderer starts
+  // inactive; no setting grades or overrides anything while inactive; leaving photo mode (what Exit sends)
+  // puts every value back, even after a warm sepia session.
+  {
+    const NrPhotoSettings start = nr::PhotoSettingsNow();
+    Check(!start.active && !start.hide && !nr::PhotoGradeNeeded(start), "the renderer starts outside photo mode");
+    Check(start.cel == -1 && start.sharpness == -1 && std::isnan(start.brightness) && std::isnan(start.gamma),
+          "outside photo mode the player's own picture settings apply");
+    Values warm = v;
+    warm.look = 2;
+    warm.temperature = 100;
+    warm.exposure = 1;
+    warm.contrast = 150;
+    warm.saturation = 50;
+    warm.vignette = 60;
+    warm.grain = 40;
+    warm.letterbox = 3;
+    warm.flip = true;
+    warm.dof = 50;
+    warm.cel = 1;
+    warm.brightness = 20;
+    warm.gamma = 1.3f;
+    Check(nr::PhotoGradeNeeded(nr::SanitizePhotoSettings(ToRenderer(warm, true))), "a sepia session grades");
+    for (int look = 0; look <= 6; ++look) {
+      NrPhotoSettings off = ToRenderer(warm, true);
+      off.look = uint32_t(look);
+      off.active = 0;
+      Check(!nr::PhotoGradeNeeded(nr::SanitizePhotoSettings(off)), "no grade pass while photo mode is closed");
+    }
+    nr::SetPhotoSettings(ToRenderer(warm, true));
+    Check(nr::PhotoGradeNeeded(nr::PhotoSettingsNow()), "the renderer grades while photo mode is open");
+    nr::SetPhotoSettings(ToRenderer(Values{}, false));  // photo_mode.cpp Exit
+    const NrPhotoSettings after = nr::PhotoSettingsNow();
+    Check(!after.active && !after.hide && !nr::PhotoGradeNeeded(after), "leaving photo mode ends the grade");
+    Check(after.look == 0 && after.exposure == 0 && after.contrast == 1 && after.saturation == 1 &&
+              after.temperature == 0 && after.vignette == 0 && after.grain == 0 && after.letterbox == 0 &&
+              !after.flip && after.dof == 0,
+          "leaving photo mode restores the identity grade");
+    Check(after.cel == -1 && after.sharpness == -1 && std::isnan(after.brightness) && std::isnan(after.gamma),
+          "leaving photo mode gives the picture settings back to the player");
+    const auto c = nr::PhotoGradeColour(after, {0.8f, 0.5f, 0.2f});
+    Check(Near(c[0], 0.8f, 1e-4f) && Near(c[1], 0.5f, 1e-4f) && Near(c[2], 0.2f, 1e-4f),
+          "the neutral grade leaves a colour unchanged");
+    // The Present pass at the default brightness and gamma: the game's ramp alone (none when it set none).
+    const nr::PictureAdjust picture = nr::PictureAdjust::FromSettings(0.0, 1.0);
+    std::array<uint16_t, 768> unset{}, game{};
+    for (uint32_t i = 0; i < 768; ++i) game[i] = uint16_t((i % 256) * 200 + (i / 256) * 7);
+    Check(picture.identity() && !nr::PictureAdjust::PresentUsesRamp(unset, picture),
+          "default brightness and gamma add no ramp");
+    Check(picture.PresentRamp(game) == game, "default brightness and gamma keep the game's own ramp");
+  }
+  // Field of view: the game's until set, then the player's.
+  Values f = v;
+  Check(Near(FieldOfViewRadians(f, 1.2f), 1.2f), "field of view follows the game until set");
+  f.fov = 90;
+  Check(Near(FieldOfViewRadians(f, 1.2f), 3.14159265f / 2, 1e-4f), "field of view in degrees");
+  // Picture names.
+  std::tm t{};
+  t.tm_year = 126, t.tm_mon = 9, t.tm_mday = 18, t.tm_hour = 3, t.tm_min = 4, t.tm_sec = 5;
+  Check(PictureName(t, 42) == "kk-photo-20261018-030405-042.png", "picture name");
+
+  // The camera: clamped to its radius, roll keeps the axes at right angles.
+  using kk::freecam::Vec;
+  const Vec centre{1, 2, 3};
+  const Vec far = kk::freecam::ClampToRadius({1, 2, 103}, centre, 15);
+  Check(Near(far.z, 18) && Near(far.x, 1), "camera clamped to the radius");
+  const Vec inside = kk::freecam::ClampToRadius({2, 2, 3}, centre, 15);
+  Check(Near(inside.x, 2), "camera inside the radius untouched");
+  kk::freecam::Camera cam;
+  cam.yaw = 0.7f, cam.pitch = 0.2f;
+  for (float roll : {0.0f, 0.5f, -1.0f}) {
+    const Vec r = kk::freecam::RollAxis(cam.Right(), cam.Up(), roll, true);
+    const Vec u = kk::freecam::RollAxis(cam.Right(), cam.Up(), roll, false);
+    const Vec fw = cam.Forward();
+    Check(Near(r.x * u.x + r.y * u.y + r.z * u.z, 0, 1e-4f), "rolled right and up stay at right angles");
+    Check(Near(r.x * fw.x + r.y * fw.y + r.z * fw.z, 0, 1e-4f), "rolled right stays across the forward axis");
+    Check(Near(kk::freecam::Length(r), 1, 1e-4f), "rolled right stays unit length");
+  }
+  const Vec r0 = kk::freecam::RollAxis(cam.Right(), cam.Up(), 0, true);
+  Check(Near(r0.x, cam.Right().x) && Near(r0.y, cam.Right().y), "no roll is the free camera's own axis");
+  // The controller: triggers down / up, stick clicks faster / slower.
+  uint8_t pad[16] = {};
+  pad[7] = 255;  // right trigger
+  pad[5] = 0x40;  // left stick click
+  auto e = kk::freecam::PhotoPadFromState(pad);
+  Check(Near(e.vertical, 1) && e.fast && !e.slow, "right trigger goes up, left stick click is faster");
+  std::memset(pad, 0, sizeof(pad));
+  pad[6] = 255;
+  pad[5] = 0x80;
+  pad[4] = 0x10;  // A: the panel's (take picture), never the camera's
+  e = kk::freecam::PhotoPadFromState(pad);
+  Check(Near(e.vertical, -1) && e.slow && !e.fast, "left trigger goes down, right stick click is slower");
+  kk::freecam::PadInput in;
+  in.vertical = 1;  // what ConsumePad makes of A
+  kk::freecam::ApplyPhotoPad(e, in);
+  Check(Near(in.vertical, -1), "A does not move the photo camera");
+
+  // The renderer: only Jack's arms, by geometry and index count (never by shader alone).
+  Check(nr::PhotoHidesMesh(0x7EB7E914947CEC40ull, 14310) && nr::PhotoHidesMesh(0xD69009DC0D6F9433ull, 2928),
+        "Jack's arms and sleeves are left out");
+  Check(!nr::PhotoHidesMesh(0x7EB7E914947CEC40ull, 2928), "the count must match too");
+  // Ann's face, skin and clothing (task 072) and anything else are never left out.
+  for (uint64_t ann : {0xBE2A0AED8846FA65ull, 0x4602AF0699809BC4ull, 0x5E97B95CF5FEFC4Eull, 0x40022003D57903FBull})
+    for (uint32_t n : {7779u, 3024u, 2901u, 5298u, 14310u, 2928u}) Check(!nr::PhotoHidesMesh(ann, n), "Ann stays");
+  Check(!nr::PhotoHidesMesh(0, 14310), "an unhashed draw is never left out");
+  Check(nr::PhotoIsPauseCover(nr::kPauseCoverVs, nr::kPauseCoverPs, 4) &&
+            !nr::PhotoIsPauseCover(nr::kPauseCoverVs, nr::kPauseCoverPs, 6) &&
+            !nr::PhotoIsPauseCover(0x2E3B3ECDD3BC8D62ull, 0xB2328F814932E231ull, 4),
+        "the pause cover: its vertex and pixel shader and one quad");
+
+  // The grade's colour function.
+  NrPhotoSettings g = nr::NeutralPhotoSettings();
+  g.active = 1;
+  for (float x : {0.0f, 0.2f, 0.5f, 0.9f, 1.0f}) {
+    const auto o = nr::PhotoGradeColour(g, {x, x * 0.5f, 1 - x});
+    Check(Near(o[0], x, 1e-3f) && Near(o[1], x * 0.5f, 1e-3f) && Near(o[2], 1 - x, 1e-3f), "neutral grade is identity");
+  }
+  g.look = 1;
+  auto bw = nr::PhotoGradeColour(g, {0.8f, 0.3f, 0.1f});
+  Check(Near(bw[0], bw[1], 1e-4f) && Near(bw[1], bw[2], 1e-4f), "black and white is grey");
+  Check(Near(Luma(bw), Luma({0.8f, 0.3f, 0.1f}), 1e-3f), "black and white keeps the luminance");
+  g.look = 2;
+  auto sepia = nr::PhotoGradeColour(g, {0.5f, 0.5f, 0.5f});
+  Check(sepia[0] > sepia[1] && sepia[1] > sepia[2], "sepia is warm brown");
+  Check(Near(Luma(sepia), 0.5f, 2e-3f), "sepia keeps the luminance");
+  g.look = 0;
+  g.exposure = 1;
+  Check(nr::PhotoGradeColour(g, {0.3f, 0.3f, 0.3f})[0] > 0.3f, "positive exposure brightens");
+  g.exposure = 0;
+  g.saturation = 0;
+  auto grey = nr::PhotoGradeColour(g, {0.9f, 0.1f, 0.2f});
+  Check(Near(grey[0], grey[2], 1e-4f), "saturation 0 is grey");
+  g.saturation = 1;
+  g.temperature = 1;
+  auto warm = nr::PhotoGradeColour(g, {0.5f, 0.5f, 0.5f});
+  Check(warm[0] > warm[2], "warm white balance");
+  // Vignette and bars.
+  Check(Near(nr::PhotoVignette(1, 0.5f, 0.5f, 16.f / 9), 1), "no vignette in the centre");
+  Check(nr::PhotoVignette(1, 0.0f, 0.0f, 16.f / 9) < 0.3f, "dark corners");
+  Check(nr::PhotoUnderBars(2.39f, 0.5f, 0.02f, 1920, 1080) && !nr::PhotoUnderBars(2.39f, 0.5f, 0.5f, 1920, 1080),
+        "2.39 bars top and bottom on 16:9");
+  Check(nr::PhotoUnderBars(1.0f, 0.05f, 0.5f, 1920, 1080) && !nr::PhotoUnderBars(1.0f, 0.5f, 0.5f, 1920, 1080),
+        "1:1 bars at the sides");
+  // Junk in, sane out.
+  NrPhotoSettings junk{};
+  junk.contrast = NAN;
+  junk.look = 99;
+  junk.dof = 7;
+  junk.letterbox = 0.2f;
+  const NrPhotoSettings clean = nr::SanitizePhotoSettings(junk);
+  Check(Near(clean.contrast, 1) && clean.look == 0 && Near(clean.dof, 1) && clean.letterbox == 0, "sanitised");
+
+  // Task 264: the pause menu's frame taken again is brought back to play's brightness. Play = a gradient, the
+  // paused frame = 0.4 times it with a few "HUD" pixels that only play has; the curve undoes the 0.4.
+  {
+    const int w = 1024, h = 256;
+    std::vector<uint8_t> play(size_t(w) * h * 4), paused(play.size());
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        uint8_t* a = &play[(size_t(y) * w + x) * 4];
+        uint8_t* b = &paused[(size_t(y) * w + x) * 4];
+        for (int c = 0; c < 3; ++c) {
+          a[c] = uint8_t((x * 2 + c * 3) % 250);
+          b[c] = uint8_t(a[c] * 0.4 + 0.5);
+        }
+        if (x < 6 && y < 6) a[0] = a[1] = a[2] = 255;  // the ammo counter, only in play
+      }
+    kk::play::BrightnessLut lut{};
+    Check(kk::play::BuildBrightnessLut(play.data(), paused.data(), w, h, lut), "brightness curve built");
+    int worst = 0;
+    for (int v = 0; v <= 99; ++v)
+      for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(int(lut[c][v]) - int(v / 0.4 + 0.5)));
+    Check(worst <= 3, "brightness curve undoes 0.4");
+    bool rising = true;
+    for (int c = 0; c < 3; ++c)
+      for (int v = 1; v < 256; ++v) rising = rising && lut[c][v] >= lut[c][v - 1];
+    Check(rising && lut[0][255] == 255, "brightness curve never goes down, top stays white");
+    std::vector<uint8_t> again = paused;
+    kk::play::ApplyBrightnessLut(lut, again.data(), again.size() / 4);
+    Check(std::abs(int(again[(size_t(40) * w + 100) * 4]) - int(play[(size_t(40) * w + 100) * 4])) <= 3,
+          "frame taken again matches play");
+    // Task 272: photo mode takes the same dimming back with one gain on the output values.
+    Check(std::abs(kk::play::MeanUndim(play.data(), paused.data(), w, h) - 2.5) < 0.05, "photo mode's gain undoes 0.4");
+    std::vector<uint8_t> flat(play.size(), 0);
+    Check(!kk::play::BuildBrightnessLut(play.data(), flat.data(), w, h, lut), "no curve from a black frame");
+  }
+
+  // Task 272: the grade takes the paused game's dimming back ahead of the filters.
+  {
+    Check(kk::photo::ToRenderer(kk::photo::Values{}, true).undim == 1.f, "photo settings start without a gain");
+    NrPhotoSettings s = nr::SanitizePhotoSettings(kk::photo::ToRenderer(kk::photo::Values{}, true));
+    s.undim = 2.5f;
+    s = nr::SanitizePhotoSettings(s);
+    Check(nr::PhotoGradeNeeded(s), "the paused game's dimming taken back needs the grade pass");
+    const auto lifted = nr::PhotoGradeColour(s, {0.4f * 0.5f, 0.4f * 0.3f, 0.4f * 0.1f});
+    Check(std::abs(lifted[0] - 0.5f) < 1e-3 && std::abs(lifted[1] - 0.3f) < 1e-3 && std::abs(lifted[2] - 0.1f) < 1e-3,
+          "the dimmed colours come back to play's");
+    s.look = 1;
+    const auto bw = nr::PhotoGradeColour(s, {0.2f, 0.2f, 0.2f});
+    Check(std::abs(bw[0] - 0.5f) < 1e-3 && bw[0] == bw[1], "filters work on play's brightness");
+    NrPhotoSettings junk = s;
+    junk.undim = 0.f;
+    Check(nr::SanitizePhotoSettings(junk).undim == 1.f, "no gain from an older caller");
+    junk.undim = 100.f;
+    Check(nr::SanitizePhotoSettings(junk).undim == 6.f, "the gain stays within 6");
+  }
+
+  std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
+  return failures ? 1 : 0;
+}

@@ -1,0 +1,1464 @@
+// The game's draws with the real thing (Phase 2): translated vertex and pixel
+// shaders, textures and samplers through the resources library, vertex data
+// pulled from guest memory, the full pipeline state from the device's
+// register images, render targets keyed by their EDRAM placement, resolves as
+// copies into textures, clears, and the back buffer into the frame image at
+// Present.
+//
+// Recorded into the Renderer's frame command list on the game's render
+// thread; everything here runs under the backend's lock except
+// InvalidateRange (CPU writes to watched guest memory, from any thread).
+//
+// Binding model (shaders/include/kkshaders/abi.h): set 0 holds the three
+// constant buffers (volatile: rewritten per draw), sets 1-6 the bindless
+// tables (2D, 3D, cube and 2D array textures, samplers, vertex data buffers).
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <thread>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <future>
+#include <memory>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include <nvrhi/nvrhi.h>
+
+#include "backend/ambient_occlusion.h"
+#include "backend/smaa.h"
+#include "backend/ao_config.h"
+#include "backend/ao_timer.h"
+#include "backend/background_file_writer.h"
+#include "backend/picture_adjust.h"
+#include "backend/scene_ao.h"
+#include "backend/scene_cel.h"
+#include "backend/scene_photo.h"
+#include "backend/photo_grade.h"
+#include "backend/photo_config.h"
+#include "backend/scene_gi.h"
+#include "backend/scene_lighting.h"
+#include "backend/memory_budget.h"
+#include "backend/buffer_pool.h"
+#include "backend/retire_budget.h"
+#include "backend/draw_sink.h"
+#include "backend/driver_pipeline_cache.h"
+#include "backend/frame_log.h"
+#include "backend/game_upscale.h"
+#include "backend/pipeline_cache.h"
+#include "backend/pipeline_demand.h"
+#include "backend/resource_preload.h"
+#include "backend/chapter_texture_prepare.h"
+#include "backend/resource_preload_bundle.h"
+#include "kknr/texture_pack.h"
+#include "backend/guest_device.h"
+#include "backend/guest_memory.h"
+#include "backend/lighting_config.h"
+#include "backend/effect_settings.h"
+#include "backend/shader_library.h"
+#include "kknr/guest_texture.h"
+#include "kknr/buffers.h"
+#include "kkshaders/vertex_patch.h"
+#include "kknr/texture_cache.h"
+#include "kknr/texture_convert.h"
+#include "kkshaders/abi.h"
+#include "backend/vulkan_requirements.h"
+
+namespace nr {
+
+// REX_DEV_TESS_BENCH (a developer aid), read once: the environment does not change while the game
+// runs, and reading it at every draw was 0.8% of the render thread (task 085).
+inline bool TessellationBenchRequested() {
+  static const bool requested = std::getenv("REX_DEV_TESS_BENCH") != nullptr;
+  return requested;
+}
+
+class GameRenderer {
+  friend struct MemoryMigrationTestAccess;
+  friend struct TexturePackTestAccess;
+  friend struct VertexViewTestAccess;
+ public:
+  struct Options {
+    bool tessellation_supported = false;
+    NativeTableCapacities table_capacities = kNativeTableCapacities;
+    // Submit and complete the open list, then reopen it, before recycling
+    // descriptors that are still referenced by current/queued draws.
+    std::function<void(nvrhi::ICommandList*)> drain_descriptors;
+    // Versions of each per-draw volatile constant buffer (VS/PS/draw/scale, AO, lighting, motion).
+    // Vulkan keeps a version until the GPU has finished the list that wrote it. Versions of earlier,
+    // submitted lists are waited for when all are taken (our NVRHI patch, vulkan-buffer.cpp); those
+    // of the list being recorded cannot be. So one list takes at most volatile_budget() (7/8 of
+    // them): one more draw first completes the list with drain_descriptors and continues in it,
+    // rather than running out (task 154). D3D12's upload ring grows instead; the same bound keeps
+    // its memory in check. The game's own frames stay far below it.
+    uint32_t volatile_versions = 8192;
+    // Read each vertex element with its declaration's own endian field (the
+    // game's SHORT4N normals and tangents are 8in16 in 8in32 streams) rather
+    // than the vertex buffer's. Proven on the game's frames: with the
+    // buffer's endian, Kong's fur shells and the V-Rex's lighting follow
+    // scrambled normals.
+    bool element_endian = true;
+    // Flip the guest's front face (in case the host's winding came out the
+    // other way round).
+    bool flip_front_face = false;
+    // Small textures whose whole mip chain is in the base level's packed tail
+    // and that are bound with mip address 0: read levels 1+ from that tail
+    // (kknr::TextureOptions::mips_from_base_tail). Off: level 0 only, as the
+    // SDK.
+    bool texture_tail_mips = false;
+    bool texture_pack = false;
+    std::string texture_pack_folder;
+    // Task 284: look through the waiting originals (Request/Take for each, every frame) only when the
+    // pack stream finished a read batch or an original's pack state changed, and at least every 60
+    // frames. Off: every frame (before task 284).
+    bool texture_pack_event_scan = false;
+    // Task 284: a replacement larger than the free pack limit drops its most detailed mips until it
+    // fits (never below the original's size) instead of keeping the original. Off: kept original.
+    bool texture_pack_reduce_mips = false;
+    // Vertex buffers the game rewrites every frame stop being watched: each draw uploads the
+    // vertices it reads instead. Watching them cost a write fault per 4 KB page and frame (340 a
+    // frame in Venture: the game writes a 4 MB ring of particle vertices between its draws).
+    bool dynamic_vertex_buffers = false;
+    // Synchronous submission to the host's graphics queue, using its queue locks.
+    // Optional for embedders; without it all uploads use the draw list as before.
+    std::function<void(nvrhi::ICommandList*)> upload_submit;
+    // The port's anisotropic_override (the launcher's texture filtering): -1 the game's own, else the
+    // Xenos AnisoFilter value every sampler uses (0 off, 1 1:1, 2 2:1, 3 4:1, 4 8:1, 5 16:1), as the
+    // Xenos plugin applies it.
+    int32_t anisotropic_override = -1;
+    // The port's swap_post_effect, which the Xenos plugin applies in its swap: 0 none, 1 "fxaa",
+    // 2 "fxaa_extreme", 3 "smaa" (SMAA 1x). Applied to the frame image at Present.
+    uint32_t fxaa = 0;
+    bool effect_buffers = true;  // identified small post targets follow output; false: guest sizes
+    uint32_t sharpness = 0;  // 0 off, 1/2/3 CAS low/medium/high
+    // Create the game's pipelines on worker threads. pipeline_wait controls whether
+    // a draw waits for its pending pipeline or may be skipped (pipeline_demand.h).
+    bool async_pipelines = true;
+    // Tests (task 183): with the Vulkan graphics pipeline library, the draws' pipelines made on the draw thread
+    // (async_pipelines off) are linked from library parts as the workers' are for a draw, and never replaced.
+    bool link_draw_pipelines = false;
+    // True: every draw waits for its pending pipeline (before task 179 the default; now
+    // KK_DEV_PIPELINE_BLOCK=1 or --native_pipeline_wait=true). False: a frame never waits for a
+    // scene draw's pipeline: the draw is skipped until a worker has made it (task 179). Only with
+    // async_pipelines.
+    bool pipeline_wait = false;
+    // Without pipeline_wait: draws later draws depend on (ClassifyPipelineMiss: depth/stencil-only,
+    // stencil writes, screen-space passes and fades, frames while the game loads) still wait, so a
+    // frame is never left with a wrong picture (the V-Rex fade, task 011). False: any draw may be
+    // skipped (the pre-task-179 skip path; tests).
+    bool pipeline_wait_for_dependencies = true;
+    // Without pipeline_wait: the time a frame may spend waiting for skippable draws' pipelines before
+    // they are skipped (milliseconds, all draws of the frame together; 0 skips at once, the default).
+    double pipeline_wait_budget_ms = 0.0;
+    // Task 267: the hard cap on a frame's waits for draws later draws depend on (depth-only, stencil
+    // writes, screen-space), milliseconds, all such draws of the frame together; after it they are
+    // skipped until their pipeline is ready (pop-in for a frame or two instead of a freeze). While the
+    // game loads (its last frame may stay on screen) pipeline_loading_wait_ms. Negative: no cap (the
+    // pre-267 behaviour; --native_pipeline_must_wait_ms=-1). pipeline_wait (block-all) never has a cap.
+    double pipeline_must_wait_ms = 4.0;
+    double pipeline_loading_wait_ms = 100.0;
+    // Task 280 (chapter-start texture burst): the chapter's learned/shipped resources (resource
+    // lists, game_preload.cpp) prepared ahead of their first draw. chapter_preload_mib: new uploads per
+    // chapter (loading screen + trickle) in MiB; 64 = before task 280; GPU budget pressure keeps 64.
+    // chapter_trickle_mib: after the loading screen, for the 10 s the list is learned from, MiB of
+    // still-missing listed resources prepared per frame (0 = only during loading, before task 280).
+    uint32_t chapter_preload_mib = 64;
+    uint32_t chapter_trickle_mib = 0;
+    // Task 276: when a level's loading screen starts, the prewarm's jobs of the records tagged with that level
+    // (PipelineRecord level tags) go ahead of the rest of the list (behind draws' jobs). False: list order (the
+    // behaviour before task 276). New records are tagged with the level whatever this says.
+    bool pipeline_level_first = false;
+    // Task 276: background (prewarm) compile jobs at once while a level is being played (not loading):
+    // PlayBackgroundPipelineWorkers (pipeline_workers.h): 0 = no limit (before task 276), N = at most N,
+    // -1 = auto (few-core PCs keep a third of the workers). Menus and loading screens always run them all.
+    int32_t pipeline_play_workers = 0;
+    // The driver's pipeline cache (SetDriverPipelineCache) is saved when the workers run out of work
+    // with at least this many new pipelines made since the last save, or with any after
+    // driver_cache_save_seconds. A rebuild (the file was another driver's) is saved when the workers
+    // first run out of work, whatever the count.
+    uint32_t driver_cache_save_every = 16;
+    double driver_cache_save_seconds = 30.0;
+    // Render scale: host pixels per guest pixel of the colour and depth targets (1 = the
+    // console's size, bit for bit what the renderer always did). Resolved textures and the
+    // screen copies follow. docs/backend.md, "Render scale". Set before Initialize.
+    float render_scale_x = 1.0f, render_scale_y = 1.0f;
+    // The same for shadow maps (colour targets k_32_FLOAT whose pitch is not the frame's);
+    // 0: like the render scale.
+    float shadow_scale = 0.0f;
+    // The guest frame's width (the back buffer's pitch): a k_32_FLOAT target of any other pitch
+    // is a shadow map.
+    uint32_t guest_frame_width = 1280;
+    uint32_t guest_frame_height = 720;
+    // Temporal upscalers (docs/upscalers.md, game_upscale.cpp): off by default. When on, the scene is
+    // drawn at the upscaler's input size (the render scale divided by the mode's ratio), jittered, and
+    // upscaled to the render scale before the post effects and the HUD. Set before Initialize.
+    UpscaleConfig upscale;
+    // Debugging: show the texture a resolve wrote at this guest address instead of the frame (0 off).
+    uint32_t show_texture = 0;
+    // Ambient occlusion (docs/backend.md, "Ambient occlusion"): the settings,
+    // asked for at every depth and colour resolve, so the launcher's change of
+    // ao_mode / ao_strength applies at once. Unset (or mode 0): off, and nothing
+    // of it runs.
+    std::function<AoSettings()> ao_settings;
+    // The rest of the AO's settings (ao_config.h, docs/ao.md): method, moment, GTAO quality and
+    // radius, classifier rules, the ambient-only shader list. The default is the AO above as it
+    // always was. Set before Initialize.
+    AoConfig ao;
+    // Screen-space global illumination (gi_config.h, docs/gi.md). Off by default: nothing of it is
+    // created. Initial value before Initialize; effect_settings changes it at frame boundaries.
+    GiConfig gi;
+    // The lighting options (docs/lighting.md): shadows, water reflections, volumetric light shafts.
+    // All original by default. Initial value before Initialize; effect_settings changes it live.
+    LightingConfig lighting;
+    // Cel shading (cel_config.h, docs/cel.md). Off by default: nothing of it is created. Initial value
+    // before Initialize; effect_settings changes it live.
+    CelConfig cel;
+    std::function<EffectSettings()> effect_settings;
+    // The pipelines a run with live settings (effect_settings) makes, without the settings themselves:
+    // its scale constants (b3) and lighting constants (b5) in the layout. For the pipeline preparation
+    // before play (pipeline_prewarm.h), so what it makes is what the game makes (task 144).
+    bool live_layout = false;
+    // Log every draw of this game frame (-1 none).
+    int32_t dump_frame = -1;
+    // Debugging aids (bits): 1 the game's clears are green, 2 the frame image
+    // is magenta before the back buffer is copied in, 4 no gamma ramp, 16 plain pixel shaders at a
+    // render scale (not the scale-aware ones), 32 only frame-wide targets scale, 64 watches armed every
+    // time, 128 no widening of a written range, 8 log the pages CPU writes
+    // invalidate most (every 300 frames).
+    uint32_t debug = 0;
+    std::function<MemoryBudget()> memory_budget;
+  };
+
+  struct Stats {
+    uint64_t draws = 0;
+    uint64_t skipped_shader = 0;     // a shader could not be made
+    uint64_t skipped_target = 0;     // nothing to draw into
+    uint64_t skipped_primitive = 0;  // primitive type not handled
+    uint64_t skipped_pipeline = 0;   // pipeline creation failed
+    uint64_t skipped_pending = 0;    // pipeline still being created (async_pipelines)
+    uint64_t pipeline_waits = 0;     // draws that waited for their pipeline (pipeline_wait)
+    double pipeline_wait_ms = 0;
+    uint64_t pipeline_budget_waits = 0;  // draws drawn after waiting within pipeline_wait_budget_ms
+    uint64_t must_draw_skips = 0;        // task 267: draws that wait, skipped once the frame's cap was used
+    // Task 179: waits by why the draw had to wait (PipelineMissClass; kScene = within the budget), and
+    // the pipelines skipped draws missed: how many, and how long (frames, ms) until they were drawn.
+    std::array<uint64_t, size_t(PipelineMissClass::kCount)> pipeline_waits_by_class{};
+    uint64_t pipelines_missed = 0;       // pipelines whose draws were skipped
+    uint64_t pipelines_missed_ready = 0;  // of those, made and drawn since
+    uint64_t missed_frames_total = 0, missed_frames_max = 0;  // frames in which its draws were skipped
+    double missed_ms_total = 0, missed_ms_max = 0;  // first skip to the request that found it ready
+    uint64_t dynamic_vertex_buffers = 0;  // vertex buffers turned dynamic
+    uint64_t dynamic_vertex_bytes = 0;    // bytes their draws uploaded
+    uint64_t cache_recorded = 0;     // descriptions appended to the pipeline cache file
+    double resource_save_render_ms = 0;  // render-thread time in SaveResourcePreload (task 177: encode + queue)
+    uint64_t prewarm_queued = 0;     // cached descriptions sent to the workers
+    uint64_t prewarm_deferred = 0;   // cached descriptions whose shaders were not available yet
+    uint64_t prewarm_failed = 0;     // cached descriptions that could not be built or created
+    uint64_t prewarm_other_kind = 0;  // cached descriptions of another render scale or face flip: not made
+    uint64_t list_records = 0;       // descriptions read from shipped pipeline lists
+    int32_t driver_cache_load = -1;  // DriverPipelineCache::Load of the driver's cache file, -1 none
+    uint64_t driver_cache_saves = 0;
+    uint64_t edram_targets = 0, edram_framebuffers = 0;  // retained cache entries
+    uint64_t edram_target_bytes = 0;  // driver memory requirements, excludes retired textures
+    uint64_t driver_cache_bytes = 0;  // the driver's data at the last save
+    uint64_t skipped_device = 0;     // no device struct
+    uint64_t texture_uploads = 0;
+    uint64_t texture_failures = 0;
+    uint64_t buffer_uploads = 0;
+    uint64_t upload_bytes = 0;       // guest textures, vertices, indices and draw constants (not auxiliary passes)
+    uint64_t early_upload_bytes = 0, early_upload_batches = 0;
+    uint64_t prepared_resources = 0, prepared_discarded = 0;
+    uint64_t preloaded_resources = 0, preload_hits = 0, preload_hash_misses = 0, preload_bytes = 0;
+    uint64_t trickled_resources = 0, trickle_bytes = 0;  // task 280: preloaded after the loading screen
+    double resource_prepare_ms = 0;  // render-thread wall time of joined first-use batches
+    uint64_t draw_constant_uploads = 0, draw_constant_identical = 0;
+    // Draws (and upscaler motion draws) recorded in one list since it opened or last completed:
+    // the most so far, the lists completed early to stay within volatile_budget(), and the draws
+    // skipped instead when the list cannot be completed (no drain_descriptors).
+    uint32_t volatile_peak_draws = 0, volatile_peak_motion = 0;
+    uint64_t volatile_completions = 0, volatile_skipped = 0;
+    uint64_t scale_uploads = 0, scale_identical = 0;
+    uint64_t vertex_binds = 0, vertex_repeated = 0;
+    uint64_t descriptor_updates = 0, graphics_states = 0, pipeline_changes = 0;
+    uint64_t clears = 0;
+    uint64_t resolves = 0;
+    uint64_t resolve_failures = 0;
+    uint64_t pipelines = 0;
+    uint64_t draw_pipelines = 0;     // of those, the game draws' (and the prewarm's), not the built-in passes'
+    uint64_t invalidations = 0;
+    uint64_t presents_missing = 0;  // no host target for the back buffer
+    uint64_t ao_applied = 0;        // scene copies the ambient occlusion went into
+    uint64_t aliases = 0;           // textures converted from a resolve through another format
+    uint64_t alias_failures = 0;
+    double pipeline_ms = 0;         // time spent creating pipelines
+    // Task 183 (Vulkan graphics pipeline library): draws' pipelines linked from parts, their time (worker), and
+    // the whole pipelines that replaced them.
+    uint64_t pipelines_linked = 0;
+    double linked_ms_total = 0, linked_ms_max = 0;
+    uint64_t pipelines_replaced = 0;
+    double replace_ms_total = 0;
+    uint64_t shader_parts = 0;      // game shaders whose library part was made when the game created them
+    double shader_parts_ms = 0;
+    double texture_ms = 0;          // time spent converting and uploading textures
+    uint64_t pack_textures_ready = 0;  // texture pack replacements finished uploading (task 211)
+    uint64_t pack_upload_bytes = 0;    // texture pack bytes written to the GPU (task 211)
+    // Task 284: render-thread milliseconds in ServiceTexturePacks (all of it), of which creating
+    // replacement textures, creating/writing upload strips and whole-level writes.
+    double pack_service_ms = 0, pack_create_ms = 0, pack_strip_ms = 0, pack_write_ms = 0, pack_scan_ms = 0,
+           pack_sweep_ms = 0;
+    double buffer_ms = 0;           // vertex and index buffers: finding, creating and uploading
+    double target_ms = 0;           // render targets and framebuffers: finding and creating
+  };
+
+  GameRenderer(nvrhi::IDevice* device, const GuestMemory& memory, kknr::GuestMemory physical,
+               ShaderLibrary* shaders);
+  ~GameRenderer();
+
+  bool Initialize();
+  // Record the fallback contents before the first draw or built-in pass can sample them.
+  void UploadDummies(nvrhi::ICommandList* cl);
+  Options& options() { return options_; }
+  uint64_t frame_number() const { return frame_; }  // the frame EndFrame publishes (dev traces)
+  // Any target or texture at a scale other than 1 (the pixel shaders must be render scale aware).
+  bool scaled() const {
+    return bool(options_.effect_settings) || options_.live_layout || memory_scale_aware_ ||
+            options_.render_scale_x != 1.0f || options_.render_scale_y != 1.0f ||
+           (options_.shadow_scale > 0.0f && options_.shadow_scale != 1.0f) ||
+           (upscale_ && (upscale_->in_x != 1.0f || upscale_->in_y != 1.0f));
+  }
+  // The temporal upscaler's state (null when off; tests and logging).
+  const GameUpscale* upscale() const { return upscale_.get(); }
+  const Stats& stats() const { return stats_; }
+  // The game's level resources are loading (task 211: the worst-frame detail; render thread).
+  bool resource_loading() const { return resource_loading_; }
+  // Task 183: the Vulkan graphics pipeline library's parts and links (all zero without it; as
+  // nvrhi::vulkan::IDevice::PipelineLibraryStats, without the Vulkan headers here).
+  struct PipelineLibraryStats {
+    uint64_t partsMade[4] = {};    // vertex input, pre-rasterization, fragment shader, fragment output
+    uint64_t partsReused[4] = {};
+    uint64_t partFailures = 0;
+    double partMs = 0;
+    uint64_t links = 0;
+    uint64_t linkFailures = 0;
+    double linkMs = 0;
+  };
+  PipelineLibraryStats PipelineLibraryCounts() const;
+  // The frame timing summary (backend.cpp): the GPU time of each pass group since the last call, from
+  // the timers that already run (AO and the upscale point with the graphics panel's live settings, GI
+  // and the lighting options while they are on). frames == 0: not timed in the window.
+  struct EffectGpuWindow {
+    AoGpuTimer::Window ao, gi, upscaler, shadows, water, volumetrics, cel;
+  };
+  EffectGpuWindow TakeEffectGpuWindow();
+  // The most draws and motion draws one list took since the previous call (logged with the frame timing).
+  struct VolatileWindow { uint32_t draws = 0, motion = 0; };
+  VolatileWindow TakeVolatileWindow();
+  uint32_t volatile_budget() const { return std::max(1u, options_.volatile_versions - options_.volatile_versions / 8); }
+
+  // Pipeline stutter (docs/backend.md, "Stutter counter"): frames in which a draw waited for its
+  // pipeline (on a worker within the budget or with pipeline_wait, or made on the draw thread) or
+  // was skipped because it was not ready. Counted at each frame's end; any thread may read it.
+  struct StutterStats {
+    uint64_t frames = 0;
+    uint64_t stutter_frames = 0;   // frames that waited or skipped
+    uint64_t frames_waited = 0;    // frames in which a draw waited for a pipeline
+    uint64_t frames_skipped = 0;   // frames in which a draw was skipped, its pipeline not ready
+    uint64_t draws_skipped = 0;    // those draws
+    double wait_ms = 0;            // all the waiting
+    double worst_wait_ms = 0;      // the most one frame waited, in all
+    uint64_t worst_wait_frame = 0;
+  };
+  StutterStats stutter() const;
+
+  // Enables CPU write notifications for a physical range (the SDK's watches);
+  // the notifications come back through InvalidateRange.
+  void set_watch(std::function<void(uint32_t physical, uint32_t bytes)> watch);
+  // Guest memory was written by the CPU (any thread).
+  void InvalidateRange(uint32_t physical, uint32_t bytes);
+  // The SDK's notification of a CPU write to watched memory (any thread, inside its fault handler):
+  // invalidates and returns the range that may be unwatched, which is every watched range the write
+  // touched, whole. A game that rewrites a 7 MB vertex buffer then faults once for it instead of
+  // once per 4 KB page (1,800 faults a frame in Venture, 18 instead of 30 frames a second).
+  std::pair<uint32_t, uint32_t> OnGuestWrite(uint32_t physical, uint32_t bytes);
+
+  void Draw(nvrhi::ICommandList* cl, const DrawCall& call);
+  void Clear(nvrhi::ICommandList* cl, const ClearCall& call);
+  void Resolve(nvrhi::ICommandList* cl, const ResolveCall& call);
+  // Copies the game's back buffer into target (the frame image). False when
+  // there is nothing to show yet.
+  bool Present(nvrhi::ICommandList* cl, uint32_t device, nvrhi::ITexture* target);
+  // After the frame's command list was submitted.
+  void EndFrame();
+  // Render-thread loading-screen service. Also callable with an explicit state
+  // by offline fixtures; the normal path reads the title's loading variables.
+  void PreloadResources(nvrhi::ICommandList* cl, bool loading, uint32_t level, uint32_t start);
+  // Render-thread idle service. Does no work unless the same loading request is
+  // still active; completed CPU work is polled, never joined by a game frame.
+  void IdleTexturePreload();
+  // Versioned chapter hints shipped beside the executable. Read before the first
+  // draw; independent of the writable pipeline/local-learning cache.
+  bool LoadResourceList(const std::string& path);
+  // Task 177: the learned resource lists and the pipeline cache file's new records are written on a
+  // background thread (never in a frame). Blocks until everything queued so far is on disk (tests).
+  void FlushFileWrites() { file_writer_.Flush(); }
+
+  // The pipeline cache file (pipeline_cache.h): reads the descriptions of earlier runs and
+  // starts creating them on the worker threads, then appends each new description the draws
+  // need. Needs async_pipelines on Vulkan (the workers); otherwise the file is only recorded.
+  // Call before the first draw; may be called from another thread.
+  bool SetPipelineCache(const std::string& path);
+  // A pipeline list shipped beside the game (the nr_pipelines tool merges the cache files of several
+  // runs into one): read, never written, and its descriptions made on the workers like the cache
+  // file's (each description once, whichever source names it first), so a fresh install makes every
+  // pipeline at start. Needs async_pipelines on Vulkan, as the cache file's prewarm. False when the
+  // file is absent or of another version. May be called with or without SetPipelineCache.
+  bool LoadPipelineList(const std::string& path);
+  // The driver's pipeline cache (driver_pipeline_cache.h; the cache NVRHI's device creates every
+  // pipeline with): reads `path` into it now, and saves it there when the workers run out of work
+  // (Options::driver_cache_save_every) and when the renderer is destroyed. Call before the first
+  // draw and before SetPipelineCache / LoadPipelineList, which start the workers: nothing may create
+  // a pipeline while the file is read. When the file was another driver's (or damaged) the cache
+  // starts empty, the prewarm fills it again in the background and the first save after it replaces
+  // the file. `cache` must outlive the renderer.
+  DriverPipelineCache::Load SetDriverPipelineCache(DriverPipelineCache* cache, const std::string& path);
+  // Saves the driver's pipeline cache now (when one is set). False when nothing could be saved.
+  bool SaveDriverPipelineCache();
+  // Saves so far (any thread; stats() has them from the frame's end).
+  uint64_t driver_cache_saves() const { return driver_cache_saves_.load(); }
+  // Blocks until the worker threads have finished the queued prewarm (tests, shutdown), the save of
+  // the driver's pipeline cache that may follow included.
+  void WaitForPrewarm();
+  // The workers' progress (any thread): descriptions the prewarm queued, pipelines the workers made
+  // (the prewarm's and the draws'), jobs not started and jobs being made.
+  struct WorkerProgress {
+    uint64_t queued = 0, made = 0, waiting = 0, active = 0;
+    uint64_t failed = 0;
+  };
+  WorkerProgress worker_progress();
+  // The records still waiting for their shaders (a list naming shaders the pack does not have).
+  std::vector<PipelineRecord> deferred_records() {
+    std::lock_guard lock(cache_mutex_);
+    return deferred_;
+  }
+
+  // REX_DEV_FRAME_LOG: the draw and resolve lines of frame_log.h, from the game's
+  // calls. Off until set; emit null = the warning log (the harness reads it there).
+  void SetFrameLog(const FrameLogConfig& config, FrameLog::Emit emit = nullptr);
+  FrameLog* frame_log() { return frame_log_.get(); }
+  // The microcode hash the Xenos log prints for a vertex shader bound with this declaration
+  // and these streams: the library patches the fetches (kkshaders/vertex_patch.h).
+  uint64_t ObjectVertexShaderHash(uint32_t object_address, uint32_t* bytes_out);
+  // NrApi::vertex_shader_patched: the hash of the microcode the library patched for the shader's
+  // declaration (what the GPU runs and the Xenos log hashes), for the frame log.
+  void VertexShaderPatched(uint32_t shader, uint32_t microcode, uint32_t declaration);
+  uint64_t PatchedVertexShaderHash(const GameShader& vs, uint32_t declaration, const dev::DeviceView& d);
+
+  // The ambient-only AO's shader list (null unless --native_ao_apply=ambient), for the shader library.
+  std::shared_ptr<const kkshaders::AmbientTable> ao_ambient_table() const;
+  // The pipelines' layout (Initialize): equal for two renderers whose pipelines can be shared.
+  uint64_t layout_signature() const { return layout_signature_; }
+  // The lighting options' replacement pixel shaders (game_lighting.cpp), for the shader library.
+  std::unordered_map<uint64_t, ShaderLibrary::Replacement> LightingReplacements() const;
+  // The GTAO method's state (null with the legacy method; tests and logging).
+  const SceneAo* scene_ao() const { return scene_ao_.get(); }
+  // The screen-space GI's state (null when it is off; tests and logging).
+  const SceneGi* scene_gi() const { return scene_gi_.get(); }
+  // The cel shading's state (null when it is off; tests and logging).
+  const SceneCel* scene_cel() const { return scene_cel_.get(); }
+
+  // The host render targets made so far (tests and debugging).
+  struct TargetInfo {
+    bool depth = false;
+    uint32_t edram_base = 0, pitch = 0, format = 0;  // the key
+    uint32_t width = 0, height = 0;           // the guest's size
+    uint32_t host_width = 0, host_height = 0;  // the texture's
+    nvrhi::Format host_format = nvrhi::Format::UNKNOWN;
+    nvrhi::ITexture* texture = nullptr;
+  };
+  std::vector<TargetInfo> DebugTargets() const;
+
+ private:
+  // ---- bindless tables
+  enum Table : uint32_t { kTex2D, kTex3D, kTexCube, kTex2DArray, kSamplers, kBuffers, kTableCount };
+  struct DescriptorTable {
+    nvrhi::BindingLayoutHandle layout;
+    nvrhi::DescriptorTableHandle table;
+    uint32_t capacity = 0;
+    uint32_t next = 1;  // slot 0 is the dummy
+    std::vector<uint32_t> free;
+    std::vector<uint64_t> last_used;
+    std::deque<std::pair<uint64_t, uint32_t>> retired;  // (frame, slot)
+  };
+  uint32_t AllocateSlot(Table table);
+  void RetireSlot(Table table, uint32_t slot);
+  void WriteSlot(Table table, const nvrhi::BindingSetItem& item);
+  void TouchSlot(Table table, uint32_t slot);
+  void RecycleDescriptors(Table table);
+  void PrepareDescriptorDraw(nvrhi::ICommandList* cl, const GameShader& vs, const GameShader* ps);
+
+  // ---- render targets: one host texture per EDRAM placement
+  struct HostTarget {
+    nvrhi::TextureHandle texture;
+    uint64_t allocation_bytes = 0;
+    // Only a whole colour clear or a whole depth AND stencil clear can be
+    // represented without GPU storage. Any attachment use invalidates this.
+    bool clear_only = false;
+    nvrhi::Color saved_color;
+    float saved_depth = 1.0f;
+    uint8_t saved_stencil = 0;
+    nvrhi::Format format = nvrhi::Format::UNKNOWN;
+    uint32_t width = 0, height = 0;  // in guest pixels (the pitch and the rows drawn so far)
+    uint32_t host_width = 0, host_height = 0;  // the texture's: the guest's times the scale
+    float scale_x = 1.0f, scale_y = 1.0f;
+    bool depth = false;
+    uint64_t key = 0;
+    // Upscalers: the output generation (the targets after the upscale point, at the output size; the
+    // key has kOutputGeneration), the renderer frame the target was last used in, and the frame its
+    // contents were last carried over from the other generation.
+    bool output_gen = false;
+    uint64_t used_frame = UINT64_MAX, migrated_frame = UINT64_MAX;
+  };
+  static constexpr uint64_t kOutputGeneration = 1ull << 62;
+  // A target's key (the input generation's; the output generation's has kOutputGeneration as well).
+  static uint64_t TargetKeyOf(bool depth, uint32_t edram_base, uint32_t pitch, uint32_t format);
+  struct Scale {
+    float x = 1.0f, y = 1.0f;
+  };
+  // The scale of the targets with this pitch (shadow maps have their own) in a generation (upscalers:
+  // the input generation is the upscaler's input size).
+  Scale ScaleFor(bool depth, uint32_t pitch, uint32_t format, bool output_gen = true);
+  static int32_t ScaleCoord(int32_t v, float s) { return s == 1.0f ? v : int32_t(std::lround(double(v) * s)); }
+  static nvrhi::Rect ScaleRect(const nvrhi::Rect& r, float sx, float sy) {
+    return nvrhi::Rect(ScaleCoord(r.minX, sx), ScaleCoord(r.maxX, sx), ScaleCoord(r.minY, sy),
+                       ScaleCoord(r.maxY, sy));
+  }
+  std::unordered_set<uint32_t> shadow_pitches_;
+  // generation: -1 the current one (upscalers: the input generation before the upscale point, the
+  // output one after it and in frames without a scene), 0 input, 1 output. Without an upscaler there
+  // is one generation.
+  HostTarget* GetTarget(bool depth, uint32_t edram_base, uint32_t pitch, uint32_t format,
+                        uint32_t height, int generation = -1);
+  HostTarget* FindTarget(bool depth, uint32_t edram_base, uint32_t pitch, uint32_t format, int generation = -1);
+  bool RestoreTarget(HostTarget& target);
+  void CheckMemoryBudget();
+  void TrimClearTargets();
+  bool InitializeMemoryMigration();
+  void ApplyMemoryScale(nvrhi::ICommandList* cl);
+  bool MigrateMemoryDepth(nvrhi::ICommandList* cl, nvrhi::ITexture* from, nvrhi::ITexture* to,
+                         nvrhi::IFramebuffer* framebuffer, nvrhi::IBindingSet* set);
+  nvrhi::IGraphicsPipeline* MemoryColorPipeline(nvrhi::Format format);
+  bool memory_scale_aware_ = false, memory_migration_ready_ = false;
+  float memory_floor_x_ = 1.0f, memory_floor_y_ = 1.0f;
+  float memory_shadow_limit_ = 0.0f;
+  float pending_memory_scale_ = 0.0f;
+  uint32_t memory_scale_steps_ = 0;
+  nvrhi::ShaderHandle memory_depth_ps_;
+  nvrhi::BindingLayoutHandle memory_depth_layout_;
+  std::array<nvrhi::GraphicsPipelineHandle, 9> memory_depth_pipelines_;
+  struct MemoryReplacement {
+    uint64_t key = 0;
+    nvrhi::TextureHandle source, texture;
+    nvrhi::FramebufferHandle framebuffer;
+    nvrhi::BindingSetHandle bindings;
+    Scale scale;
+    uint32_t width = 0, height = 0, old_width = 0, old_height = 0;
+    uint64_t bytes = 0;
+  };
+  std::vector<MemoryReplacement> memory_staged_;
+  std::array<float, 3> memory_staged_options_{};
+  size_t memory_staged_index_ = 0, memory_staged_target_count_ = 0;
+  uint64_t memory_staged_first_frame_ = 0;
+  std::chrono::steady_clock::time_point memory_sample_{};
+  std::chrono::steady_clock::time_point memory_start_{};
+  uint32_t memory_pressure_samples_ = 0;
+  bool memory_half_ao_ = false;
+  uint64_t memory_evictions_ = 0, memory_restores_ = 0;
+  static nvrhi::Format ColorTargetFormat(uint32_t format);
+  kknr::TextureOptions TextureOptions() const {
+    kknr::TextureOptions o;
+    o.mips_from_base_tail = options_.texture_tail_mips;
+    return o;
+  }
+  nvrhi::IFramebuffer* GetFramebuffer(const std::array<HostTarget*, 4>& colors, HostTarget* depth);
+  // The attachment formats, for pipeline keys.
+  static uint64_t FormatSignature(const std::array<HostTarget*, 4>& colors, const HostTarget* depth);
+
+  // ---- textures, samplers, buffers
+  // A pack replacement's identity: the original's content hash, format and size
+  // (the stream's request key). Originals with equal identity share one replacement.
+  struct PackKey {
+    uint64_t hash = 0;
+    uint32_t format = 0, width = 0, height = 0;
+    bool operator==(const PackKey&) const = default;
+  };
+  struct PackKeyHash {
+    size_t operator()(const PackKey& k) const {
+      return size_t(k.hash ^ (uint64_t(k.format) << 48) ^ (uint64_t(k.width) << 24) ^ k.height);
+    }
+  };
+  struct HostTexture {
+    uint64_t pack_hash = 0, pack_allocation = 0;
+    HostTexture* replacement = nullptr;  // original: its (possibly shared) pack replacement
+    bool pack_ready = false;
+    bool pack_unavailable = false;
+    bool pack_capped = false;  // kept original: its replacement did not fit the pack limit
+    // Original: freed at a chapter change while unused; it asks again only once bound.
+    bool pack_swept = false;
+    uint64_t pack_used_frame = 0;    // original: last frame it was bound or uploaded
+    uint64_t pack_capped_bytes = 0;  // original: the replacement size that did not fit
+    uint32_t pack_refs = 0;          // replacement: the originals sharing it
+    PackKey pack_key;                // replacement: its identity
+    uint64_t material_hash = 0;
+    nvrhi::TextureHandle texture;
+    kknr::HostTexturePlan plan;
+    nvrhi::Format format = nvrhi::Format::UNKNOWN;
+    bool render_target = false;  // made by a resolve (usable as a blit target)
+    bool preloaded = false;
+    // Resolved from a scaled target: the host texture is the guest's size times this.
+    float scale_x = 1.0f, scale_y = 1.0f;
+    std::unordered_map<uint32_t, uint32_t> views;  // view key -> descriptor index
+    // Resolves: bumped on every write, and whether the texels are depth
+    // values (a depth source into R32F).
+    uint64_t serial = 0;
+    bool depth = false;
+    // A texture whose memory a resolve wrote through another texture object
+    // (other format or size): the converted copy and the write it holds.
+    const HostTexture* alias_source = nullptr;
+    uint64_t alias_serial = 0;
+    // Upscalers: the same resolved texture at the other scale (the scene copy is resolved at the
+    // input size before the upscale point and at the output size after it, every frame), kept so the
+    // two are not made again each time. Owned; released with this one.
+    HostTexture* twin = nullptr;
+  };
+  // The host texture a resolve writes for this plan at this scale: the entry's, its twin swapped in,
+  // or a new one (the old one becoming the twin when only the scale differs).
+  HostTexture* ResolveDestTexture(kknr::TextureCache::Entry& entry, const kknr::HostTexturePlan& plan, bool drawable,
+                                  float scale_x, float scale_y);
+  // The copy part of a resolve (Resolve, and the upscale point's copies again): source rectangle in
+  // guest pixels, into the texture of `fetch`. True when copied.
+  bool ResolveCopy(nvrhi::ICommandList* cl, HostTarget* source, bool from_depth, uint32_t format, int32_t sx,
+                   int32_t sy, int32_t w, int32_t h, const kknr::TextureFetch& fetch, int32_t dx, int32_t dy,
+                   uint32_t level, uint32_t slice);
+  // The texture at a resolved texture's address seen through another fetch
+  // constant (the light shafts read the depth resolve's k_24_8 memory as
+  // k_8_8_8_8): a converted copy of the resolve's texture.
+  HostTexture* AliasTexture(nvrhi::ICommandList* cl, kknr::TextureCache::Entry& entry,
+                            const kknr::TextureFetch& fetch, const HostTexture* source);
+  // Descriptor index (with bit 31 for a 2D array) for a texture fetch slot.
+  // base_map: a sampler of the slot uses the base level only (mip filter
+  // "base map"), so the view holds one level.
+  uint32_t BindTexture(nvrhi::ICommandList* cl, const uint32_t words[6],
+                       kkshaders::TextureDimension dimension, bool base_map);
+  HostTexture* UploadTexture(nvrhi::ICommandList* cl, kknr::TextureCache::Entry& entry,
+                             const kknr::TextureFetch& fetch);
+  HostTexture* CreateHostTexture(const kknr::HostTexturePlan& plan, bool render_target, float scale_x = 1.0f,
+                                 float scale_y = 1.0f, kknr::ResourceWork* profile = nullptr);
+  // The scale of the texture BindTexture bound last (1 when none).
+  float bound_scale_x_ = 1.0f, bound_scale_y_ = 1.0f;
+  // Set by a failed bind, copied by Draw and logged only if the draw is submitted.
+  std::string texture_bind_failure_;
+  void ReleaseHostTexture(HostTexture* host);
+  // Textures and buffers the caches let go of, kept for as many frames as a retired descriptor
+  // slot. The frames still on the GPU may sample them through the bindless tables, and the open
+  // command list may hold their state without a reference (NVRHI's Vulkan clears and the tables
+  // do not add one): destroying them at once freed images the command list then put a barrier on
+  // at its close (a crash in the NVIDIA driver at the start of the Venture chapter).
+  void RetireResource(nvrhi::IResource* resource);
+  nvrhi::TextureHandle fxaa_source_;  // Options::fxaa: the frame before spatial anti-aliasing
+  nvrhi::TextureHandle cas_source_;
+  std::unique_ptr<AoGpuTimer> cas_timer_;
+  // Dev aid (KK_DEV_POST_SPLIT=1, game_upscale.cpp): the GPU time of the frame's work in pieces: before
+  // the upscale point by target (pitch, format, size), the upscale point, after it by target, kind (draw,
+  // clear, resolve) and pixel shader, then Present; and a log line for each new target. Logged every 600
+  // frames; nothing without the variable.
+  struct PostSplitBucket {
+    std::string what;
+    std::unique_ptr<AoGpuTimer> timer;
+  };
+  std::map<uint64_t, PostSplitBucket> post_split_;
+  AoGpuTimer* post_split_open_ = nullptr;
+  int post_split_on_ = -1;
+  bool PostSplitOn();
+  void PostSplitMark(nvrhi::ICommandList* cl, uint64_t bucket, const char* what);
+  void PostSplitTarget(nvrhi::ICommandList* cl, const HostTarget* target, char kind, uint64_t shader = 0);
+  void PostSplitFrameEnd(nvrhi::ICommandList* cl);
+  std::unique_ptr<Smaa> smaa_;
+  std::deque<std::pair<uint64_t, nvrhi::ResourceHandle>> retired_resources_;  // (frame, resource)
+  // Destroys the retired resources past their GPU lifetime within a per-frame time budget (task 174:
+  // a whole chapter's trim destroyed in one frame was a 50-130 ms frame); see retire_budget.h.
+  void ReleaseRetiredResources();
+  RetireBudget retire_budget_;
+  bool retire_budget_checked_ = false;
+  uint64_t retire_backlog_frames_ = 0, retire_backlog_released_ = 0;
+  double retire_backlog_ms_ = 0, retire_backlog_budget_ms_ = 0;
+  uint32_t TextureView(HostTexture* host, const kknr::TextureFetch& fetch,
+                       kkshaders::TextureDimension dimension, bool base_map);
+  // extra_lod_bias: added to the fetch constant's (the upscalers' mip bias for the scene's draws).
+  uint32_t BindSampler(const uint32_t words[6], const kkshaders::SamplerBinding& binding, float extra_lod_bias = 0.0f);
+  struct HostBuffer {
+    nvrhi::BufferHandle buffer;  // a pooled one's block (task 309)
+    BufferPool::Range range;     // pooled (--native_d3d12_buffer_pool): the bytes of `buffer` it owns
+    BufferPool* pool = nullptr;  // the pool `range` is from
+    uint32_t view_bytes = 0;     // bytes of its view (the size its own buffer would have had)
+    uint32_t slot = 0;  // kBuffers descriptor (vertex data)
+    uint32_t bytes = 0;
+    // Dynamic vertex data (Options::dynamic_vertex_buffers): re-uploaded in consecutive frames.
+    uint64_t last_upload_frame = ~0ull;
+    uint32_t upload_streak = 0;
+    bool dynamic = false;
+    bool preloaded = false;
+    kknr::BufferCache::Entry* entry = nullptr;
+  };
+  // Task 309: the guest buffer's memory, pooled when --native_d3d12_buffer_pool is on (buffer_pool.h).
+  bool MakeHostBuffer(HostBuffer* host, const nvrhi::BufferDesc& desc, bool index);
+  uint64_t BufferOffset(const HostBuffer* host) const { return host->range.valid() ? host->range.allocation.offset : 0; }
+  nvrhi::BindingSetItem VertexView(const HostBuffer* host) const;
+  // A pooled range's bytes past the upload (up to view_bytes) hold an old owner's data: zeroed, as a
+  // new buffer's were.
+  void ZeroPooledTail(nvrhi::ICommandList* list, const HostBuffer* host, uint64_t written);
+  std::unique_ptr<BufferPool> vertex_pool_, index_pool_;
+  std::unordered_set<HostTexture*> descriptor_textures_;
+  std::unordered_set<HostBuffer*> descriptor_buffers_;
+  // used_begin / used_end: the bytes of the buffer this draw reads (a dynamic buffer uploads only
+  // those); the whole buffer when unknown.
+  HostBuffer* BindVertexBuffer(nvrhi::ICommandList* cl, uint32_t physical, uint32_t bytes, uint32_t used_begin = 0,
+                               uint32_t used_end = ~0u);
+  // Whether BindVertexBuffer would upload only the used bytes of this buffer (a dynamic one).
+  bool IsDynamicVertexBuffer(uint32_t physical, uint32_t bytes);
+  HostBuffer* BindIndexBuffer(nvrhi::ICommandList* cl, uint32_t physical, uint32_t bytes,
+                              bool index32);
+  void ProcessInvalidations();
+  void PrepareResourceUploads(nvrhi::ICommandList* cl, const DrawCall& call,
+                              const dev::DeviceView& device, const GameShader& vs, const GameShader* ps);
+  void PrepareResourceRequests(nvrhi::ICommandList* cl, const std::vector<ResourcePreloadRecord>& requests,
+                               bool preload = false);
+  void PollResourcePreload(nvrhi::ICommandList* cl);
+  void RememberResource(ResourcePreloadRecord record, const kknr::ResidentEntry& entry);
+  void SaveResourcePreload();
+  std::string resource_cache_base_, resource_cache_path_;
+  std::vector<ResourcePreloadRecord> preload_records_, learned_resources_;
+  void PrepareChapterTextures();
+  static void ZeroUnwrittenSubresources(nvrhi::ICommandList* list, nvrhi::ITexture* texture,
+                                        const kknr::HostTextureData& data);
+  std::unique_ptr<ChapterTexturePrepare> chapter_textures_;
+  std::vector<uint32_t> chapter_candidates_;
+  size_t chapter_candidate_cursor_ = 0;
+  uint64_t chapter_texture_generation_ = 0, chapter_texture_uploads_ = 0;
+  uint64_t chapter_texture_attempts_ = 0, chapter_texture_matches_ = 0, chapter_texture_stale_ = 0;
+  uint64_t chapter_texture_idle_ = 0;
+  uint32_t chapter_texture_screen_ = 0, chapter_texture_state_ = 0;
+  nvrhi::CommandListHandle chapter_texture_list_;
+  nvrhi::EventQueryHandle chapter_texture_query_;
+  bool chapter_texture_submitted_ = false;
+  std::vector<ResourcePreloadChapter> shipped_resources_;  // protected by cache_mutex_
+  std::unordered_set<const kknr::ResidentEntry*> resource_seen_;
+  size_t preload_cursor_ = 0;
+  uint32_t preload_level_ = 0, preload_start_ = 0;
+  bool resource_loading_ = false, resource_learning_ = false, resource_cache_dirty_ = false;
+  uint64_t resource_poll_frame_ = ~0ull, preload_reserved_bytes_ = 0;
+  std::chrono::steady_clock::time_point resource_learn_start_;
+  static constexpr uint64_t kChapterPreloadBytes = 64ull << 20;
+  // Task 280: the new-upload cap of this chapter's preparation (options_.chapter_preload_mib, 64 MiB
+  // under GPU budget pressure) and the gameplay trickle window after its loading screen.
+  uint64_t ChapterPreloadBytes() const;
+  std::chrono::steady_clock::time_point resource_trickle_until_;
+  bool resource_trickle_ = false, resource_sweep_ = false;
+  static constexpr int kChapterSweepMs = 40;
+  // Task 280 diagnostics: the guest textures the first gameplay frames after a loading screen still
+  // upload at their draw (log lines "chapter start frame"), and whether the chapter list had them.
+  struct StartUploads {
+    uint32_t frames_left = 0, frame = 0;
+    uint32_t textures = 0, listed = 0, prepared = 0;
+    uint64_t bytes = 0, listed_bytes = 0;
+    double texture_ms = 0, prepare_ms = 0;
+    uint64_t trickled = 0, trickle_bytes = 0;
+  } start_uploads_;
+  void NoteStartUpload(const kknr::TextureFetch& fetch, uint64_t bytes, bool prepared);
+  // Task 284: a log line for a frame whose texture pack work on the render thread took >= 2 ms.
+  void LogTexturePackFrame();
+  double pack_logged_ms_[6] = {}, pack_window_ms_ = 0;
+  uint64_t pack_events_seen_ = ~0ull, pack_scan_frame_ = 0, pack_scans_ = 0, pack_window_scans_ = 0;
+  bool pack_scan_ = true;  // task 284: an original's pack state changed; look through them this frame
+  uint32_t pack_frame_lines_ = 0;
+  void EndStartUploadFrame();
+  std::unique_ptr<class ResourceUploadWorkers> resource_upload_workers_;
+  std::atomic<uint64_t> resource_revision_{0};
+  void TryPrepareResourceUploads(nvrhi::ICommandList* cl);
+  const DrawCall* resource_prepare_call_ = nullptr;
+  const dev::DeviceView* resource_prepare_device_ = nullptr;
+  const GameShader* resource_prepare_vs_ = nullptr;
+  const GameShader* resource_prepare_ps_ = nullptr;
+  bool resource_prepare_tried_ = false;
+  std::vector<kknr::VertexElement> scratch_preparation_declaration_;
+  void ProfileResources();
+  kknr::ResourceWork resource_work_;
+  kknr::ResourceWork* resource_profile_ = nullptr;
+  FILE* resource_profile_file_ = nullptr;
+  void LogInvalidationHistogram();
+  std::unordered_map<uint32_t, uint64_t> invalidation_histogram_;  // --native_debug=8
+  uint64_t invalidation_bytes_ = 0;
+
+  // ---- pipelines
+  // The request / ready / fallback interface (pipeline_demand.h): the pipeline when it is made, else
+  // kNow makes it here (the built-in passes), kMustDraw waits for a worker, kMaySkip and kOptional
+  // queue it and return null (the caller skips the draw or keeps its original pass).
+  nvrhi::IGraphicsPipeline* GetPipeline(const nvrhi::GraphicsPipelineDesc& desc,
+                                        nvrhi::IFramebuffer* framebuffer, uint64_t key,
+                                        PipelineDemand demand = PipelineDemand::kNow) {
+    return GetPipeline(desc, framebuffer->getFramebufferInfo(), key, demand);
+  }
+  nvrhi::IGraphicsPipeline* GetPipeline(const nvrhi::GraphicsPipelineDesc& desc,
+                                        const nvrhi::FramebufferInfo& framebuffer, uint64_t key,
+                                        PipelineDemand demand = PipelineDemand::kNow,
+                                        PipelineMissClass miss_class = PipelineMissClass::kScene);
+  // Finished pipelines (the draws' and the prewarm's) join pipelines_; pipeline_mutex_ held, render thread.
+  void DrainDonePipelinesLocked();
+  // The class a draw's missing pipeline is asked for with (Options::pipeline_wait and friends).
+  PipelineMissClass DrawMissClass(const PipelineRecord& record) const;
+  // Task 179: pipelines skipped draws are missing (render thread): since when, for the time-to-ready.
+  struct MissingPipeline {
+    uint64_t first_frame = 0, last_frame = 0;
+    uint64_t frames = 1;  // frames in which a draw of it was skipped (how long the object was missing)
+    std::chrono::steady_clock::time_point first;
+  };
+  std::unordered_map<uint64_t, MissingPipeline> missing_pipelines_;
+  void LogPipelineMisses(bool final);
+  Stats miss_log_previous_{};
+  void BuildPipelineDesc(const PipelineRecord& record, nvrhi::IShader* vs, nvrhi::IShader* ps,
+                         nvrhi::GraphicsPipelineDesc& desc, nvrhi::FramebufferInfo& framebuffer) const;
+  bool IsPending(uint64_t key);
+  // NR_PIPELINE_LOG=<csv> (diagnostic, task 171): one row per pipeline a draw or pass asked for that
+  // was not made yet (made on demand during play, or a prewarm job it waited for), with the wait and
+  // the draw's record when there is one.
+  void LogPipelineDemand(uint64_t key, const char* kind, double ms, bool made,
+                         PipelineMissClass miss_class = PipelineMissClass::kScene);
+  FILE* pipeline_log_ = nullptr;
+  bool pipeline_log_checked_ = false;
+  const PipelineRecord* demand_record_ = nullptr;  // the draw's record while Draw asks for its pipeline
+  void EnsureWorkers();
+  // A description the draws need: appended to the cache file the first time.
+  void NoteRecord(const PipelineRecord& record, uint64_t key);
+  // Queues the description of a cached record for the workers; false when a shader is not there
+  // yet (the record waits in deferred_ for the next try).
+  bool QueuePrewarm(const PipelineRecord& record);
+  // QueuePrewarm, or into deferred_ when its shaders are not there yet; a record of another kind of
+  // run is left out (cache_mutex_ held).
+  void QueueOrDefer(const PipelineRecord& record);
+  void QueueRecordVariants(const PipelineRecord& record);
+  // PipelineRecord::flags for this renderer's draws.
+  uint32_t RecordFlags() const;
+  void RetryDeferred();
+  void PipelineWorker();
+  // Task 183: how a worker makes a job's pipeline. With the Vulkan graphics pipeline library (pipeline_library_):
+  // a draw's pipeline is linked from cached parts at once and compiled whole in the background (kReplace swaps it
+  // in); the prewarm also makes each record's parts, so later new pipelines of the same shaders link at once.
+  enum class PipelineBuild : uint8_t {
+    kWhole,    // compiled whole (no library, or not a draw's)
+    kPrewarm,  // a listed record: its library parts, then whole
+    kLinked,   // a draw waits or skips: linked now, then a kReplace job
+    kReplace,  // the whole pipeline that replaces a linked one
+    kParts,    // a shader the game created: its library part (pre-rasterization or fragment shader), no pipeline
+  };
+  struct PipelineJob {
+    uint64_t key = 0;
+    nvrhi::GraphicsPipelineDesc desc;
+    nvrhi::FramebufferInfo framebuffer;
+    bool urgent = false;
+    PipelineBuild build = PipelineBuild::kWhole;
+    uint32_t level = 0;  // task 276: the listed record's level tag (PipelineRecord::reserved[0]; 0 = none)
+  };
+  struct DonePipeline {
+    uint64_t key = 0;
+    nvrhi::GraphicsPipelineHandle pipeline;
+    PipelineBuild build = PipelineBuild::kWhole;
+    double ms = 0;  // the worker's time making it
+    bool urgent = false;  // a draw asked for it
+  };
+  // The Vulkan device links pipelines from library parts (nvrhi::Feature::GraphicsPipelineLibrary).
+  bool pipeline_library_ = false;
+  bool pipeline_library_link_only_ = false;  // KK_DEV_GPL_LINK_ONLY=1 (dev): linked pipelines are never replaced
+  // Task 183: the game's shaders get their library parts made on the workers when the game creates them (behind
+  // the prewarm), so a later new pipeline of them links without compiling (KK_DEV_GPL_NO_SHADER_PARTS=1: not).
+  void QueueShaderParts(bool vertex, const nvrhi::ShaderHandle& shader);
+  std::unordered_set<const nvrhi::IShader*> shader_parts_queued_;  // pipeline_mutex_
+  bool PrepareLibraryParts(const nvrhi::GraphicsPipelineDesc& desc, const nvrhi::FramebufferInfo& framebuffer);
+  // Linked pipelines replaced by their whole ones: released two frames later (a draw may still hold the pointer).
+  std::vector<std::pair<uint64_t, nvrhi::GraphicsPipelineHandle>> replaced_pipelines_;
+  void LogPipelineLibrary(bool final);
+  uint64_t library_logged_links_ = ~0ull, library_logged_parts_ = ~0ull;
+  std::vector<std::thread> pipeline_threads_;
+  std::condition_variable pipeline_done_cv_;
+  PipelineCacheFile cache_file_;
+  // Task 177: file writes off the render thread (learned resource lists, the cache file's new records).
+  // Stopped (flushed and joined) in the destructor before cache_file_ closes.
+  BackgroundFileWriter file_writer_;
+  std::atomic<bool> pipeline_records_queued_{false};
+  std::mutex cache_mutex_;                    // the file and deferred_ (SetPipelineCache comes from another thread)
+  std::vector<PipelineRecord> deferred_;
+  std::unordered_set<uint64_t> prewarm_seen_;  // keys sent to the prewarm from any source (cache_mutex_)
+  std::atomic<bool> cache_recording_{false};
+  std::unordered_set<uint64_t> noted_keys_;   // render thread only
+  int pipelines_active_ = 0;                  // jobs a worker is compiling (pipeline_mutex_)
+  uint64_t pipelines_made_ = 0;               // jobs the workers finished (pipeline_mutex_)
+  uint64_t pipelines_failed_ = 0;             // failed creations (pipeline_mutex_)
+  uint64_t deferred_shader_count_ = 0;        // shaders registered when deferred_ was last tried
+  std::mutex pipeline_mutex_;
+  std::condition_variable pipeline_cv_;
+  std::deque<PipelineJob> pipeline_jobs_;
+  uint64_t must_wait_frame_ = ~0ull;  // task 267: the frame must_wait_ms_ counts (render thread)
+  double must_wait_ms_ = 0;           // this frame's waits of draws later draws depend on
+  int dev_compile_delay_ms_ = 0;      // KK_DEV_PIPELINE_DELAY_MS (dev): a slow PC's cold compiles
+  // Task 276: level tags and the workers while playing.
+  void PipelineLevelLoading(uint32_t level);  // render thread: a level's loading screen started
+  void PipelineLevelPlaying();                // render thread: its loading screen ended
+  uint32_t record_level_tag_ = 0;   // the tag new records get (render thread; 0 before the first level)
+  uint32_t priority_level_tag_ = 0;  // the level whose prewarm jobs go first (pipeline_mutex_)
+  bool pipelines_playing_ = false;   // a level is being played: play_background_ applies (pipeline_mutex_)
+  unsigned play_background_ = 1;     // background jobs at once while playing (EnsureWorkers)
+  unsigned all_background_ = 1;      // and otherwise
+  bool play_workers_logged_ = false;
+  std::vector<DonePipeline> pipelines_done_;
+  std::unordered_map<uint64_t, bool> pipelines_pending_;
+  bool pipeline_stop_ = false;
+  double pipeline_worker_ms_ = 0;
+  // Pipeline creation holds it shared, reading the driver's cache file exclusively.
+  std::shared_mutex creation_mutex_;
+  // background: a worker's compile, refused (nullptr) once the program is about to exit (pipeline_exit_gate.h).
+  nvrhi::GraphicsPipelineHandle CreatePipeline(const nvrhi::GraphicsPipelineDesc& desc,
+                                               const nvrhi::FramebufferInfo& framebuffer, bool background = false);
+  // The driver's pipeline cache: the file, pipelines made since the last save, and whether the
+  // first save is due as soon as the workers are idle (a rebuild).
+  void MaybeSaveDriverCache();
+  bool SaveDriverCacheLocked();  // driver_cache_save_mutex_ held
+  std::atomic<uint64_t> driver_cache_saves_{0}, driver_cache_bytes_{0};  // stats_ takes them at EndFrame
+  DriverPipelineCache* driver_cache_ = nullptr;
+  std::string driver_cache_path_;
+  std::atomic<uint64_t> driver_cache_new_{0};
+  std::atomic<bool> driver_cache_rebuild_{false};
+  std::mutex driver_cache_save_mutex_;
+  std::chrono::steady_clock::time_point driver_cache_saved_at_;
+
+  // ---- frame log (game_frame_log.cpp)
+  // --native_dump_frame: the three candidates for the Xenos log's vs hash (docs/backend.md, "The vertex
+  // shader hash"): the database's microcode, the microcode in the shader object's memory right now (the
+  // library may patch in place), and the reproduced patching.
+  void DumpVertexShaderHashes(const DrawCall& call, const dev::DeviceView& d, const GameShader& vs);
+  void LogDraw(const DrawCall& call, const dev::DeviceView& d, const GameShader& vs, const GameShader* ps);
+  void LogResolve(const ResolveCall& call, const dev::DeviceView& d);
+  void LogClear(const ClearCall& call, const dev::DeviceView& d);
+  void LogSwap(const dev::DeviceView& d);
+  // A draw's line waits for the next call the library forwards (draw, clear, resolve, present):
+  // the library patches the vertex shader's fetches for the draw's declaration inside its draw,
+  // after the hook, so the object holds this draw's microcode only once the draw returned.
+  void FlushPendingDraw();
+  void NoteDrawNotDrawn(bool pending);
+  bool has_pending_draw_ = false;
+  FrameLogDraw pending_draw_;
+  uint32_t pending_vs_object_ = 0;
+  uint64_t pending_vs_template_ = 0;
+  int pending_not_drawn_ = -1;  // -1 drawn, 0 pipeline missing, 1 pipeline not ready
+  // The library keeps a patched copy per (shader, declaration, strides) and patches again only for
+  // a new combination, so the hash is kept per combination (VertexShaderPatched).
+  std::unordered_map<uint64_t, uint64_t> patched_vs_hash_;
+  std::mutex patched_mutex_;  // the hook's thread writes it, the render thread reads it
+  uint64_t pending_vs_key_ = 0;
+  std::unique_ptr<FrameLog> frame_log_;
+  std::unordered_map<uint64_t, uint64_t> patched_hashes_;
+
+  // ---- passes
+  struct ViewportSetup {
+    nvrhi::Viewport viewport;
+    nvrhi::Rect scissor;
+    float ndc_scale[3] = {1, 1, 1};
+    float ndc_offset[3] = {0, 0, 0};
+  };
+  // width, height: the guest's target size (the vertex shaders' clip space is in guest pixels);
+  // the viewport and scissor are in host pixels (the guest's times the scale).
+  ViewportSetup ComputeViewport(const dev::DeviceView& d, uint32_t width, uint32_t height, float scale_x,
+                                float scale_y) const;
+  void ClearRect(nvrhi::ICommandList* cl, HostTarget* color, HostTarget* depth, const nvrhi::Rect& rect,
+                 const float rgba[4], bool clear_color, bool clear_depth, bool clear_stencil, float z,
+                 uint32_t stencil);
+  bool Blit(nvrhi::ICommandList* cl, nvrhi::ITexture* source, int32_t sx, int32_t sy, int32_t w,
+            int32_t h, nvrhi::ITexture* dest, uint32_t dest_level, uint32_t dest_slice, int32_t dx,
+            int32_t dy, const uint32_t channels[4], uint32_t blit_flags = 0, uint32_t blit_arg = 0,
+            int32_t dest_width = 0, int32_t dest_height = 0,
+            nvrhi::IFramebuffer* prepared_framebuffer = nullptr, nvrhi::IBindingSet* prepared_set = nullptr);
+  static constexpr uint32_t kBlitGammaRamp = 1;   // r, g, b through the display gamma ramp
+  static constexpr uint32_t kBlitFxaa = 16;       // FXAA (blit_arg: edge search steps)
+  static constexpr uint32_t kBlitCas = 32;        // CAS (blit_arg: low/medium/high 1/2/3)
+  static constexpr uint32_t kBlitDepthBytes = 2;  // a depth value as the D24S8 word's bytes
+  static constexpr uint32_t kBlitBytesToDepth = 4;  // 8:8:8:8 colour holding those bytes back to depth
+  static constexpr uint32_t kBlitTexelBytesToDepth = 8;  // the same from a texture's X, Y, Z, W bytes
+  bool Dump(uint32_t frame) const {
+    return (options_.dump_frame >= 0 && uint32_t(options_.dump_frame) == frame) || LightingCensusFrame(frame);
+  }
+
+  nvrhi::IDevice* device_;
+  const GuestMemory& memory_;
+  kknr::GuestMemory physical_;
+  ShaderLibrary* shaders_;
+  Options options_;
+  Stats stats_;
+  uint64_t frame_ = 0;
+  // Texture placeholder warnings already logged, one per (vs, ps, stage and slot, reason); bounded.
+  std::unordered_set<uint64_t> placeholder_warned_;
+  Stats debug_previous_;
+  kkshaders::ScaleConstants last_scale_ = {};
+  nvrhi::IGraphicsPipeline* debug_last_pipeline_ = nullptr;
+
+  std::array<DescriptorTable, kTableCount> tables_;
+  nvrhi::BindingLayoutHandle constants_layout_;
+  uint64_t layout_signature_ = 0;
+  nvrhi::BindingSetHandle constants_set_;
+  nvrhi::BufferHandle vs_constants_, ps_constants_, draw_constants_, scale_constants_;
+  std::vector<nvrhi::BindingLayoutHandle> pipeline_layouts_;  // set 0 + the six tables
+
+  nvrhi::TextureHandle dummy_2d_, dummy_3d_, dummy_cube_, dummy_array_;
+  nvrhi::SamplerHandle dummy_sampler_;
+  nvrhi::BufferHandle dummy_buffer_;
+  bool dummies_uploaded_ = false;
+  void EnsureFallbackResources(nvrhi::ICommandList* cl);
+
+  std::unordered_map<uint64_t, std::unique_ptr<HostTarget>> targets_;
+  std::unordered_map<uint64_t, nvrhi::FramebufferHandle> framebuffers_;
+  std::unordered_map<uint64_t, uint64_t> framebuffer_used_;
+  std::unordered_map<uint64_t, nvrhi::GraphicsPipelineHandle> pipelines_;
+
+  // Ambient occlusion (null until Initialize, and when its shaders are missing).
+  std::unique_ptr<AmbientOcclusion> ao_;
+
+  // ---- ambient occlusion, method gtao (game_ao.cpp, docs/ao.md). The hooks are called from
+  // Initialize, Draw, Clear, Resolve and Present; scene_ao_ is null with the legacy method.
+  void AoLayoutBindings(nvrhi::BindingLayoutDesc& set0) const;  // b4 for the ambient-only shaders
+  bool AoSetBindings(nvrhi::BindingSetDesc& set0);
+  void AoInitialize();
+  AoSettings AoSettingsFor(uint64_t frame);
+  SceneAo::Draw AoDescribeDraw(const DrawCall& call, const dev::DeviceView& d, const std::array<HostTarget*, 4>& colors,
+                               HostTarget* depth, const PipelineRecord& record, const GameShader& vs,
+                               const GameShader* ps) const;
+  void AoDrawHook(nvrhi::ICommandList* cl, const DrawCall& call, const dev::DeviceView& d,
+                  const std::array<HostTarget*, 4>& colors, HostTarget* depth, const PipelineRecord& record,
+                  const GameShader& vs, const GameShader* ps);
+  void AoWriteAmbientConstants(nvrhi::ICommandList* cl, bool reads);
+  void AoRecordMotionHook(const DrawCall& call, const dev::DeviceView& d, const GameShader& vs);
+  nvrhi::ITexture* AoResolveHook(nvrhi::ICommandList* cl, const AoResolve& r, const AoSettings& s,
+                                 const ResolveCall& call, const HostTarget* source);
+  void AoClearHook(const ClearCall& call, const HostTarget* depth);
+  void AoPresentHook(nvrhi::ICommandList* cl);
+  // AO on the first-person hands (task 244, docs/ao.md): geometry the scene's depth pre-pass draws depth-only
+  // with depth func ALWAYS (Jack's arms, what he holds) is noted; when its opaque colour draw comes after the
+  // occlusion went into the scene, that draw is made a second time with ao_hands.hlsl (depth EQUAL, colour
+  // times the occlusion). Nothing runs with AO off.
+  void AoNoteHandsDepth(const DrawCall& call, const PipelineRecord& record, bool writes_color);
+  void AoRedrawHands(nvrhi::ICommandList* cl, const DrawCall& call, const PipelineRecord& record, const GameShader& vs,
+                     const nvrhi::GraphicsState& gs, const nvrhi::DrawArguments& args, bool indexed,
+                     const HostTarget& target);
+  uint32_t AoOcclusionSlot(nvrhi::ITexture* texture);  // the occlusion's slot in the 2D table (0: none)
+  uint32_t ao_hands_depth_slot_ = 0;  // the depth the occlusion was worked out from, in the 2D table
+  nvrhi::ITexture* ao_hands_depth_texture_ = nullptr;
+  struct AoHandsKey {
+    uint32_t index_buffer = 0, start = 0, count = 0;
+    int32_t base_vertex = 0;
+    bool operator==(const AoHandsKey&) const = default;
+  };
+  std::vector<AoHandsKey> ao_hands_;
+  uint64_t ao_hands_frame_ = UINT64_MAX;
+  nvrhi::ShaderHandle ao_hands_ps_;
+  struct AoHandsStats {
+    uint64_t noted = 0, drawn = 0, waiting = 0;
+  } ao_hands_stats_;
+  std::unique_ptr<SceneAo> scene_ao_;
+  std::unique_ptr<AoGpuTimer> ao_timer_;  // --native_ao_gpu_time
+
+  // ---- lighting options (game_lighting.cpp, docs/lighting.md). Called from Draw, Resolve and Present
+  // when an option is on or the census runs (options_.lighting.active()).
+  bool LightingCensusFrame(uint64_t frame) const;
+  void LightingCensusDraw(const DrawCall& call, const dev::DeviceView& d, const std::array<HostTarget*, 4>& colors,
+                          HostTarget* depth, const PipelineRecord& record, const GameShader& vs, const GameShader* ps);
+  void LightingDrawHook(nvrhi::ICommandList* cl, const DrawCall& call, const dev::DeviceView& d,
+                        const std::array<HostTarget*, 4>& colors, HostTarget* depth, const PipelineRecord& record,
+                        const GameShader& vs, const GameShader* ps);
+  void LightingLayoutBindings(nvrhi::BindingLayoutDesc& set0) const;  // b5 when an option is on
+  bool LightingSetBindings(nvrhi::BindingSetDesc& set0);
+  void LightingInitialize();
+  void LightingWriteConstants(nvrhi::ICommandList* cl);
+  // The shadow maps' scale (host texels per guest texel).
+  float LightingShadowScale() const;
+  // The soft shadows: the pitch of the target the game's screen-space shadow (psshadowquad) draws into
+  // (640 wide, 640x480 used, for a 1280x720 frame) gets kLightingMaskScale times the render scale
+  // (with an upscaler, its input scale). 1.5 (Beta 14, task 348a; 2 before): the mask is as tall as the
+  // scene and three quarters of its width, after the game's blur no visible change, 0.4 ms less GPU time
+  // at 4K DLSS Quality (mask 0.68 -> 0.40 ms, blur and composite 0.30 -> 0.18 ms).
+  void LightingNoteShadowMask(const GameShader& ps, uint32_t pitch);
+  // The texture a resolve made that fetch constant `slot` reads (null for anything else).
+  nvrhi::ITexture* LightingResolvedTexture(const dev::DeviceView& d, uint32_t slot);
+  static constexpr float kLightingMaskScale = 1.5f;
+  std::unordered_set<uint32_t> lighting_mask_pitches_;
+  nvrhi::BufferHandle lighting_constants_;  // b5 (kkshaders/lighting.h)
+  struct LightingState {
+    // Shadows: PCSS's penumbra width per unit of light-space depth, the receiver plane bias's limit.
+    float penumbra_scale = 300.0f;
+    float slope_limit = 0.01f;
+    std::array<uint8_t, 224> constants_last = {};  // sizeof(kkshaders::LightingConstants)
+    float water_axes[3][4] = {};  // the last water draw's flat planes (WaterPlanesFromConstants)
+    uint32_t water_axes_logged = 0;
+    bool constants_valid = false;
+    nvrhi::ICommandList* constants_list = nullptr;
+    uint64_t constants_frame = 0;
+    // Water reflections: the scene's colour and depth pyramid and a linear sampler in the bindless tables.
+    nvrhi::SamplerHandle sampler, wrap_sampler;
+    uint32_t sampler_slot = 0, wrap_sampler_slot = 0, color_slot = 0, depth_slot = 0;
+    nvrhi::ITexture* color_slot_texture = nullptr;
+    nvrhi::ITexture* depth_slot_texture = nullptr;
+  };
+  LightingState lighting_;
+  std::unique_ptr<SceneLighting> scene_lighting_;  // null unless an option needs per-frame work
+  void LightingPresentHook(nvrhi::ICommandList* cl);
+  std::shared_ptr<const GameShader> LiveLightingShader(const GameShader& base);
+  nvrhi::BufferHandle ao_constants_;  // b4 (ambient-only)
+  std::array<uint32_t, 8> ao_constants_last_ = {};
+  bool ao_constants_valid_ = false;
+  nvrhi::ICommandList* ao_constants_list_ = nullptr;
+  uint64_t ao_constants_frame_ = 0;
+  uint32_t ao_slot_ = 0;  // the occlusion's slot in the 2D table
+  nvrhi::ITexture* ao_slot_texture_ = nullptr;
+  uint64_t ao_settings_frame_ = UINT64_MAX;
+  AoSettings ao_settings_;
+
+  // ---- screen-space global illumination (game_gi.cpp, docs/gi.md). The hooks are called from
+  // Initialize, Draw, Clear, Resolve and Present; scene_gi_ is null when it is off.
+  void GiInitialize();
+  void GiDrawHook(nvrhi::ICommandList* cl, const DrawCall& call, const dev::DeviceView& d,
+                  const std::array<HostTarget*, 4>& colors, HostTarget* depth, const PipelineRecord& record,
+                  const GameShader& vs, const GameShader* ps);
+  void GiClearHook(const ClearCall& call, const HostTarget* depth);
+  void GiResolveHook(const ResolveCall& call, const HostTarget* source, bool from_depth);
+  void GiPresentHook(nvrhi::ICommandList* cl);
+  bool GiAoOn(uint64_t frame);
+  std::unique_ptr<SceneGi> scene_gi_;
+  std::unique_ptr<AoGpuTimer> gi_timer_;  // --native_gi_gpu_time
+  // ---- cel shading (game_cel.cpp, docs/cel.md). The hooks are called from Initialize, Draw, Clear,
+  // Resolve and Present; scene_cel_ is null when it is off.
+  void CelInitialize();
+  void CelDrawHook(nvrhi::ICommandList* cl, const DrawCall& call, const dev::DeviceView& d,
+                   const std::array<HostTarget*, 4>& colors, HostTarget* depth, const PipelineRecord& record,
+                   const GameShader& vs, const GameShader* ps);
+  void CelClearHook(const ClearCall& call, const HostTarget* depth);
+  void CelResolveHook(const ResolveCall& call);
+  void CelPresentHook();
+  void UpdateCel(const CelConfig& want);
+  std::unique_ptr<SceneCel> scene_cel_;
+  std::unique_ptr<AoGpuTimer> cel_timer_;  // --native_cel_gpu_time (else the panel's only)
+  std::future<std::unique_ptr<SceneCel>> cel_build_;
+  std::unique_ptr<SceneCel> cel_parked_;
+  uint64_t cel_parked_frame_ = 0;
+  std::deque<std::pair<uint64_t, std::unique_ptr<SceneCel>>> retired_cel_;
+  bool cel_build_failed_ = false, cel_user_gpu_time_ = false;
+  // ---- photo mode (game_photo.cpp, docs/photo-mode.md; task 208): the game's settings each frame
+  // (plugin/native_photo.h). While it is off nothing here runs and nothing is made.
+ public:
+  // After the frame's Present copy (renderer.cpp): the photo grade into the frame image.
+  void PhotoPresent(nvrhi::ICommandList* cl, nvrhi::ITexture* frame_image);
+ private:
+  void PhotoOverrideEffects(EffectSettings& s);
+  bool PhotoHidesDraw(const DrawCall& call, const dev::DeviceView& d, const GameShader& vs, const GameShader* ps);
+  void PhotoDrawHook(nvrhi::ICommandList* cl, const DrawCall& call, const dev::DeviceView& d,
+                     const std::array<HostTarget*, 4>& colors, HostTarget* depth, const PipelineRecord& record,
+                     const GameShader& vs, const GameShader* ps);
+  void PhotoClearHook(const ClearCall& call, const HostTarget* depth);
+  void PhotoResolveHook(const ResolveCall& call);
+  NrPhotoSettings photo_ = NeutralPhotoSettings();
+  uint64_t photo_read_frame_ = UINT64_MAX;
+  int32_t photo_frame_w_ = 0, photo_frame_h_ = 0;  // the picture in the frame image (Present)
+  std::unique_ptr<PhotoGrade> photo_grade_;
+  bool photo_grade_failed_ = false;
+  std::unique_ptr<ScenePhotoDepth> scene_photo_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<ScenePhotoDepth>>> retired_photo_;
+  uint64_t photo_hidden_ = 0, photo_hidden_logged_ = 0;
+  // ---- live settings (game_effects.cpp, effect_settings.h): applied at a frame's first call.
+  struct PreparedUpscaler {
+    UpscaleConfig config;
+    std::unique_ptr<Upscaler> upscaler;  // null: the SDK did not start (the bilinear stretch instead)
+    UpscalerKind chosen = UpscalerKind::kOff;
+    std::string why;
+    double ms = 0;
+  };
+  void UpdateEffects();
+  bool AnnTessellationMaterial(const dev::DeviceView& d, const GameShader& vs, const GameShader* ps);
+  uint64_t GeometryContentHash(const DrawCall& call) const;
+  bool AnnMainTessellation(const DrawCall& call, const dev::DeviceView& d,
+                           const GameShader& vs, const GameShader* ps,
+                           kkshaders::DrawConstants& dc, PipelineRecord& record,
+                           nvrhi::IGraphicsPipeline*& pipeline);
+  struct AnnNormalLayout {
+    kknr::VertexElement element;
+    VertexBufferInfo buffer;
+    uint32_t offset = 0;
+    uint64_t normal_content = 0;
+    uint32_t stride = 0, format = 0;
+    uint64_t learned = 0, decision_frame = ~0ull, skin = 0;
+    bool admitted = false, noted = false;
+    uint64_t bones = 0;
+    PipelineRecord lit[2];
+    uint32_t seen = 0, previous_flags = 0, current_flags = 0;
+  };
+  std::unordered_map<uint64_t, AnnNormalLayout> ann_normals_;
+  nvrhi::IGraphicsPipeline* AnnTessellationPipeline(PipelineRecord& record);
+  nvrhi::IGraphicsPipeline* FindPreparedPipeline(uint64_t key);
+  uint32_t TessellationFlags() const;
+  std::vector<PipelineRecord> tessellation_records_;
+  bool tessellation_drawn_this_frame_ = false;
+  uint32_t tessellation_draws_this_frame_ = 0;
+  bool tessellation_ = false;
+  float tessellation_smoothness_ = 0.75f;
+  uint32_t tessellation_detail_ = 4, tessellation_previous_flags_ = 0;
+  std::unique_ptr<AoGpuTimer> tessellation_timer_;
+  void UpdateUpscaler(UpscaleConfig want);
+  void InstallUpscaler(const UpscaleConfig& want, PreparedUpscaler* prepared);
+  void UpdateGi(const GiConfig& want);
+  void UpdateLighting(const LightingConfig& want, float shadow_scale);
+  void PurgeOutputGeneration();
+  void FlushSamplers();
+  void PublishEffectTimes();
+  uint64_t effects_frame_ = UINT64_MAX;
+  std::string effects_heavy_;  // task 354: the effects whose switch makes or frees GPU resources (UpdateEffects)
+  std::future<std::unique_ptr<SceneGi>> gi_build_;
+  std::future<std::unique_ptr<SceneLighting>> lighting_build_;
+  std::future<PreparedUpscaler> upscale_build_;
+  // NVIDIA: NGX started once on a worker and kept (a DLSS upscaler that never evaluates holds no feature).
+  std::future<std::unique_ptr<Upscaler>> dlss_warm_;
+  std::unique_ptr<Upscaler> dlss_keepalive_;
+  bool gi_build_failed_ = false, lighting_build_failed_ = false;
+  // Turned off: kept for a while (an A/B switch back is instant), then retired.
+  std::unique_ptr<SceneGi> gi_parked_;
+  std::unique_ptr<SceneLighting> lighting_parked_;
+  uint64_t gi_parked_frame_ = 0, lighting_parked_frame_ = 0;
+  std::deque<std::pair<uint64_t, std::unique_ptr<SceneGi>>> retired_gi_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<SceneLighting>>> retired_lighting_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<GameUpscale>>> retired_upscale_;
+  std::deque<std::pair<uint64_t, std::unique_ptr<Upscaler>>> retired_upscalers_;
+  UpscaleConfig upscale_initial_, upscale_requested_;  // at the start; the one in use (or off)
+  LightingConfig lighting_initial_;
+  bool gi_user_gpu_time_ = false;  // --native_gi_gpu_time: the timers log (else the panel's only)
+  uint32_t fxaa_wanted_ = 0;
+  uint32_t vendor_ = 0;  // the GPU's PCI vendor (the panel's upscaler list)
+  uint64_t live_changes_ = 0;
+  // This frame's draws with the lighting options' shader variants (the panel shows they are applied).
+  struct LiveDraws {
+    uint32_t shadows = 0, water = 0, shadows_waiting = 0, water_waiting = 0;
+  } live_draws_;
+  double live_last_change_ms_ = 0;
+
+  kknr::TextureCache textures_;
+  // GPU-written (resolved) textures by base address, for other fetch
+  // constants over the same memory.
+  std::unordered_map<uint32_t, kknr::TextureCache::Entry*> resolved_by_base_;
+  uint64_t resolve_serial_ = 0;
+  kknr::BufferCache vertex_buffers_;
+  kknr::BufferCache index_buffers_;
+  struct CachedSampler {
+    nvrhi::SamplerHandle first;
+    uint32_t second = 0;
+    uint64_t last_used = 0;
+  };
+  std::unordered_map<uint64_t, CachedSampler> samplers_;
+
+  // ---- temporal upscalers (game_upscale.cpp, docs/upscalers.md). upscale_ is null when off; the
+  // hooks are called from Initialize, Draw, Clear, Resolve, Present and EndFrame.
+  std::unique_ptr<GameUpscale> upscale_;
+  nvrhi::ICommandList* current_cl_ = nullptr;  // the call's command list (target migration in GetTarget)
+  // Before the layouts: the upscaler and the input scale (a live change brings one made on a worker).
+  bool UpscaleSetup(PreparedUpscaler* prepared = nullptr);
+  bool UpscaleInitialize();     // after them: the passes
+  void UpscaleInitializeTimers();
+  static float UpscaleMipBiasFor(const GameUpscale& u);
+  // The upscalers' passes, made once and kept when the upscaler is made again (their pipelines are
+  // keyed by these shaders).
+  struct UpscalePasses {
+    nvrhi::ShaderHandle vs_fullscreen, camera_ps, object_ps, reactive_ps, depth_ps, stretch_ps, show_motion_ps;
+    nvrhi::BindingLayoutHandle pass_layout, motion_layout;
+    nvrhi::BindingSetHandle motion_set;
+    nvrhi::BufferHandle motion_vs_constants, motion_draw_constants, motion_constants;
+    nvrhi::SamplerHandle linear_clamp;
+  };
+  UpscalePasses upscale_passes_;
+  bool OutputGeneration() const;  // which generation the current phase draws into
+  void UpscaleNewFrame(uint64_t frame);  // the per-frame state, at the frame's first call
+  void UpscaleTakeSnapshot(nvrhi::ICommandList* cl);
+  struct UpscaleDraw {
+    bool snapshot = false;
+    bool jitter = false, motion = false, scene_phase = false;
+  };
+  // Before a draw takes its targets: classify it, take the upscale point if it is due (recorded into
+  // `cl` before the draw) and say whether it is jittered and replayed by the motion pass.
+  UpscaleDraw UpscaleBeginDraw(nvrhi::ICommandList* cl, const DrawCall& call, const dev::DeviceView& d, uint32_t pitch,
+                               uint32_t height, uint64_t color_key, uint64_t depth_key, bool writes_color,
+                               const GameShader& vs, const GameShader* ps);
+  // A draw for the motion pass (the draw's full state once it is ready to be drawn).
+  void UpscaleRecordMotion(const DrawCall& call, const dev::DeviceView& d, const std::shared_ptr<const GameShader>& vs,
+                           const kkshaders::DrawConstants& dc, const PipelineRecord& record,
+                           const nvrhi::GraphicsState& gs, const nvrhi::DrawArguments& args, bool indexed);
+  void UpscaleBeginClear(nvrhi::ICommandList* cl, const ClearCall& call, uint64_t color_key, uint64_t depth_key,
+                         bool covers_target);
+  void UpscaleBeginResolve(nvrhi::ICommandList* cl, const ResolveCall& call, uint64_t source_key, bool clears_color);
+  void UpscaleAfterResolve(const ResolveCall& call, const HostTarget* source, bool from_depth, uint32_t format,
+                           int32_t sx, int32_t sy, int32_t w, int32_t h, const kknr::TextureFetch* fetch, bool copied);
+  // At Present: the upscale point if the frame has a scene and did not reach it; a frame without a
+  // scene drawn at the input size is carried to the output size.
+  void UpscaleBeginPresent(nvrhi::ICommandList* cl);
+  void UpscaleEndFrame();
+  void RunUpscale(nvrhi::ICommandList* cl, UpscaleFrameTracker::Trigger trigger);
+  // A target of the output generation first used after the upscale point whose input twin holds
+  // this frame's picture: that picture, stretched (colour) or point-sampled (depth).
+  void MigrateTarget(nvrhi::ICommandList* cl, HostTarget* target);
+  // The upscalers' full-screen passes (upscale.hlsl), into `color` (and `depth`) over `rect`.
+  bool UpscalePass(nvrhi::ICommandList* cl, nvrhi::IShader* ps, const void* params, uint32_t params_size,
+                   nvrhi::ITexture* source0, nvrhi::ITexture* source1, nvrhi::ITexture* color0,
+                   nvrhi::ITexture* color1, nvrhi::ITexture* depth, const nvrhi::Rect& rect, uint64_t key,
+                   nvrhi::ColorMask mask = nvrhi::ColorMask::All);
+  nvrhi::IGraphicsPipeline* UpscalePipeline(nvrhi::IShader* ps, const nvrhi::FramebufferInfo& info,
+                                          nvrhi::ColorMask mask);
+  void UpscaleMotionPass(nvrhi::ICommandList* cl, HostTarget* depth_target);
+  void UpscaleLogStats();
+  std::function<void(uint32_t, uint32_t)> watch_;
+  // The ranges watched now (start -> end, overlapping ones merged), for OnGuestWrite.
+  std::mutex watched_mutex_;
+  std::map<uint32_t, uint32_t> watched_buffers_, watched_textures_;
+  std::mutex invalidation_mutex_;
+  std::vector<std::pair<uint32_t, uint32_t>> invalidations_;
+
+  // Static index patterns for non-indexed quad lists and fans, and a ring for
+  // indexed ones.
+  nvrhi::BufferHandle quad_indices_, fan_indices_, index_ring_;
+  uint64_t index_ring_used_ = 0;
+  static constexpr uint32_t kPatternVertices = 65536;
+  static constexpr uint64_t kIndexRingBytes = 8ull << 20;
+  bool patterns_uploaded_ = false;
+  std::vector<uint32_t> scratch_indices_;
+  // Renderer thread only, consumed synchronously before reuse.
+  std::vector<kknr::VertexElement> scratch_declaration_;
+  std::vector<kkshaders::DeclElement> scratch_patch_declaration_;
+  std::vector<uint8_t> scratch_index_upload_;
+  std::unique_ptr<class UploadBatch> upload_batch_;
+  nvrhi::ICommandList* EarlyUpload(uint64_t bytes);
+  void FlushUploads();
+  // Lazy CPU conversion pool. Every conversion joins before returning, so teardown has no guest/GPU work.
+  std::unique_ptr<kknr::TextureConversionWorkers> texture_conversion_workers_;
+  std::unique_ptr<kknr::TexturePackStream> texture_pack_stream_;
+  std::unordered_set<HostTexture*> pack_originals_;
+  // One GPU replacement per identity, shared by every original with it (refcounted).
+  std::unordered_map<PackKey, HostTexture*, PackKeyHash> pack_shared_;
+  uint64_t pack_shared_attached_ = 0;  // originals that reused a resident replacement (run total)
+  // Chapter change: replacements whose originals were not bound since the load
+  // started are freed this many frames after the load ends (task 180).
+  static constexpr uint64_t kPackSweepDelayFrames = 60;
+  uint64_t pack_load_frame_ = 0, pack_sweep_frame_ = UINT64_MAX;
+  bool pack_sweep_pending_ = false;
+  std::string texture_pack_folder_;
+  uint64_t pack_frame_ = ~0ull, pack_bytes_ = 0, pack_limit_ = kTexturePackFallbackLimit;
+  // Originals kept because their replacement exceeded the limit. Their data is
+  // dropped (no repeated file reads); they retry only once the smallest fits.
+  uint64_t pack_capped_ = 0, pack_capped_min_ = UINT64_MAX, pack_capped_frame_ = 0;
+  bool pack_pressure_ = false;
+  struct PackUpload {
+    HostTexture* replacement = nullptr;
+    std::shared_ptr<const kknr::HostTextureData> data;
+    uint32_t subresource = 0, row = 0;
+    uint32_t drop = 0;  // task 284: most detailed levels left out (texture_pack_reduce_mips)
+  } pack_upload_;
+  uint64_t pack_reduced_ = 0;
+  static PackKey PackKeyOf(const HostTexture& original) {
+    return {original.pack_hash, uint32_t(original.plan.format), original.plan.width, original.plan.height};
+  }
+  void ServiceTexturePacks(nvrhi::ICommandList* cl);
+  void DropTexturePacks();
+  void CapTexturePack(HostTexture* original, uint64_t bytes);
+  void UncapTexturePack(HostTexture* original);
+  // Drops this original's reference; the last one releases the replacement
+  // through the normal retirement lifetime and per-frame release budget.
+  void ReleasePackReplacement(HostTexture* original);
+  // Loading-screen service: a load into a different chapter started / ended.
+  void TexturePackLoadStarted();
+  void TexturePackLoadEnded();
+  void SweepTexturePacks();
+  void AdvanceTexturePack(nvrhi::ICommandList* cl);
+
+  // Built-in passes.
+  nvrhi::ShaderHandle blit_vs_, blit_ps_, clear_vs_, clear_ps_;
+  nvrhi::BindingLayoutHandle blit_layout_, clear_layout_;
+  nvrhi::BindingSetHandle clear_set_;
+  // The display gamma ramp (the device's copy of SetGammaRamp's table), as
+  // the Xenos plugin applies it at the swap.
+  nvrhi::TextureHandle gamma_ramp_;
+  std::array<uint16_t, 768> gamma_ramp_values_ = {};
+  bool gamma_ramp_uploaded_ = false;
+  // The player's brightness and gamma (picture_adjust.h, from the live settings): put after the game's
+  // ramp at Present; at the defaults the ramp is left as the game set it.
+  PictureAdjust picture_;
+  PictureAdjust picture_composed_for_;
+  std::array<uint16_t, 768> picture_composed_from_ = {}, picture_composed_ = {};
+  std::unordered_map<nvrhi::ITexture*, nvrhi::BindingSetHandle> blit_sets_;
+
+  // The previous draw's constants, to rewrite the volatile buffers only when
+  // they changed (and once per command list).
+  std::array<float, 1024> last_vs_ = {}, last_ps_ = {};
+  std::array<uint8_t, 4096> last_vs_raw_ = {}, last_ps_raw_ = {};  // the guest bytes of those
+  // Counts the changes of last_vs_raw_ (task 351: the motion recording's camera register search is done
+  // again only when the vertex constants changed since the draw it was last done for).
+  uint64_t vs_constants_generation_ = 0;
+  kkshaders::DrawConstants last_draw_ = {};
+  bool constants_valid_ = false;
+  nvrhi::ICommandList* constants_list_ = nullptr;
+  uint64_t constants_frame_ = 0;
+  uint64_t wait_budget_frame_ = ~0ull;  // the frame frame_wait_ms_ counts for
+  double frame_wait_ms_ = 0;
+  // This frame's stutter (render thread), folded into stutter_ at EndFrame.
+  void NoteFrameWait(double ms);
+  // Counts a draw (or motion draw) against volatile_budget() and completes the list first when it is
+  // reached; false: skip the draw (the list cannot be completed).
+  bool NoteVolatileDraw(nvrhi::ICommandList* cl, bool motion);
+  nvrhi::ICommandList* volatile_list_ = nullptr;
+  uint64_t volatile_frame_ = ~0ull;
+  uint32_t volatile_draws_ = 0, volatile_motion_ = 0;
+  std::atomic<uint32_t> volatile_window_draws_{0}, volatile_window_motion_{0};
+  bool volatile_warned_ = false;
+  bool frame_waited_ = false;
+  double frame_stutter_wait_ms_ = 0;
+  uint64_t deferred_motion_count_ = 0;
+  // Opt-in task diagnostics, written only when KK_DEV_DLSS_LOG names a file.
+  FILE* frame_trace_ = nullptr;
+  bool frame_trace_checked_ = false;
+  std::chrono::steady_clock::time_point frame_trace_last_{};
+  double frame_motion_ms_ = 0, frame_sdk_ms_ = 0, frame_target_ms_last_ = 0;
+  // Task 351 (KK_DEV_DLSS_LOG only): the render thread's time in the game's draws, the motion
+  // recording, the camera vote (with last frame's constants looked up) and draw counts.
+  double frame_draw_ms_ = 0, frame_motion_record_ms_ = 0, frame_motion_vote_ms_ = 0;
+  double frame_motion_find_ms_ = 0, frame_motion_submit_ms_ = 0, frame_draw_motion_ms_ = 0;
+  uint32_t frame_draw_calls_ = 0;
+  bool trace_draw_motion_ = false;  // this draw was recorded for the motion pass
+  struct TraceTimer {
+    double* sink;
+    std::chrono::steady_clock::time_point start;
+    explicit TraceTimer(double* s) : sink(s), start(s ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~TraceTimer() { if (sink) *sink += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+  };
+  uint64_t frame_resource_creations_ = 0;
+  uint64_t frame_skips_ = 0;
+  mutable std::mutex stutter_mutex_;
+  StutterStats stutter_;
+};
+
+}  // namespace nr

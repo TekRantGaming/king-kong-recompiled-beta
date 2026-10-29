@@ -1,0 +1,450 @@
+// Controller remapping and stick inversion.
+//
+// sub_821074E8 is the title's XInputGetState(user, state) wrapper (it calls
+// XamInputGetState) and the only place it reads the pad. After the real call
+// we rewrite the guest XINPUT_STATE (big-endian):
+//   +0 dwPacketNumber, +4 wButtons, +6 bLeftTrigger, +7 bRightTrigger,
+//   +8 sThumbLX, +10 sThumbLY, +12 sThumbRX, +14 sThumbRY.
+// Keyboard input arrives through the same path when ReXGlue's mnk_mode is on,
+// so remaps and inversion apply to it too.
+//
+// Camera sensitivity is applied to the camera's turn itself (below), so it is
+// not capped at a full push of the stick.
+
+#include <algorithm>
+#include <bit>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+#include <rex/cvar.h>
+#include <rex/hook.h>
+#include <rex/logging.h>
+
+#include "mouse_look.h"
+#include "input_diag.h"
+#include "debug_overlay.h"
+#include "play_internal.h"
+#include "benchmark.h"
+#include "settings.h"
+#include "freecam.h"
+#include "coop_observer.h"
+#include "coop_objects_game.h"
+#if defined(KK_DEV_TOOLS)
+#include "coop_runtime.h"
+#endif
+#include "menu_scene.h"
+
+namespace {
+
+#if defined(KK_DEV_TOOLS)
+// Opt-in evidence for real and virtual input, on both sides of every filter.
+struct DevInputTrace {
+  uint32_t user, native_status;
+  const uint8_t* state;
+  const uint8_t* base;
+  PPCContext& ctx;
+  std::array<uint8_t,16> native{};
+  DevInputTrace(uint32_t u,const uint8_t* s,const uint8_t* b,PPCContext& c) : user(u),native_status(c.r3.u32),state(s),base(b),ctx(c) {
+    if (s && !native_status) std::memcpy(native.data(),s,native.size());
+  }
+  ~DevInputTrace() {
+    static const bool enabled=std::getenv("KK_DEV_INPUT_TRACE")!=nullptr;
+    static auto next=std::chrono::steady_clock::time_point{};
+    static unsigned lines=0;
+    if (!enabled || user || !state || lines>=240) return;
+    const auto now=std::chrono::steady_clock::now();
+    if (now<next) return;
+    next=now+std::chrono::seconds(1); ++lines;
+    auto word=[](const uint8_t* s,int at) { return uint16_t(uint16_t(s[at])<<8|s[at+1]); };
+    auto value=[&](uint32_t at) { uint32_t v; std::memcpy(&v,base+at,4); return std::byteswap(v); };
+    REXLOG_INFO("KK dev input: native-status={} game-status={} native={:04X}/{}/{}/{}/{}/{}/{} game={:04X}/{}/{}/{}/{}/{}/{} cover={} menu={} observer={} phase={} active-pad={} native-block={} pos={:.3f}/{:.3f}/{:.3f}",
+        native_status,ctx.r3.u32,word(native.data(),4),native[6],native[7],int16_t(word(native.data(),8)),
+        int16_t(word(native.data(),10)),int16_t(word(native.data(),12)),int16_t(word(native.data(),14)),
+        word(state,4),state[6],state[7],int16_t(word(state,8)),int16_t(word(state,10)),int16_t(word(state,12)),
+        int16_t(word(state,14)),kk::play::CoverScreen(),kk::play::PauseMenuOpen(),kk::coop::observer::Active(),
+        int(kk::coop::SessionFlowSnapshot().phase),int32_t(value(0x82C63704)),value(0x82CCAE2C),
+        std::bit_cast<float>(value(0x82D64250)),std::bit_cast<float>(value(0x82D64254)),std::bit_cast<float>(value(0x82D64258)));
+  }
+};
+// Log both sides of the filters, including background virtual-pad reads. One
+// line per RT edge or change in delivery, capped for the lifetime of the process.
+struct DevFirePadTrace {
+  uint32_t user;
+  const uint8_t* state;
+  uint8_t lt, rt;
+  const char* stage = "delivered";
+  ~DevFirePadTrace() {
+    static bool held[4]{};
+    static uint8_t delivered[4]{};
+    static unsigned lines = 0;
+    if (user >= 4) return;
+    const bool down = rt > 30;
+    const bool changed = down != held[user] || (down && state[7] != delivered[user]);
+    held[user] = down; delivered[user] = state[7];
+    if (!changed || lines >= 128 || kk::coop::EnemyLinkSnapshot().role != kk::coop::Role::Guest) return;
+    ++lines;
+    REXLOG_INFO("KK dev guest fire pad: edge={} user={} virtual-LT={} virtual-RT={} game-LT={} game-RT={} stage={} cap={}/128",
+        down ? "press" : "release", user, unsigned(lt), unsigned(rt), unsigned(state[6]), unsigned(state[7]), stage, lines);
+  }
+};
+#endif
+
+constexpr uint8_t kTriggerPressThreshold = 30;  // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+
+template <typename T>
+T LoadBE(const uint8_t* p) {
+  T v;
+  std::memcpy(&v, p, sizeof(v));
+  return std::byteswap(v);
+}
+
+template <typename T>
+void StoreBE(uint8_t* p, T v) {
+  v = std::byteswap(v);
+  std::memcpy(p, &v, sizeof(v));
+}
+
+float LoadF(const uint8_t* p) { return std::bit_cast<float>(LoadBE<uint32_t>(p)); }
+void StoreF(uint8_t* p, float f) { StoreBE<uint32_t>(p, std::bit_cast<uint32_t>(f)); }
+
+void Invert(uint8_t* p) {
+  const int16_t v = LoadBE<int16_t>(p);
+  StoreBE<int16_t>(p, v == INT16_MIN ? INT16_MAX : static_cast<int16_t>(-v));
+}
+
+// Radial deadzone (rescaled so output still starts at 0) and a gain, applied to
+// one stick's X/Y pair. The gain is capped at a full push.
+void ShapeStick(uint8_t* xy, float deadzone, float gain) {
+  if (deadzone <= 0.0f && gain == 1.0f) return;
+  float x = LoadBE<int16_t>(xy) / 32767.0f, y = LoadBE<int16_t>(xy + 2) / 32767.0f;
+  const float mag = std::sqrt(x * x + y * y);
+  if (mag <= deadzone || mag == 0.0f) {
+    x = y = 0.0f;
+  } else {
+    const float scaled = std::min(1.0f, (mag - deadzone) / (1.0f - deadzone) * gain);
+    x = x / mag * scaled;
+    y = y / mag * scaled;
+  }
+  StoreBE<int16_t>(xy, static_cast<int16_t>(std::clamp(x, -1.0f, 1.0f) * 32767.0f));
+  StoreBE<int16_t>(xy + 2, static_cast<int16_t>(std::clamp(y, -1.0f, 1.0f) * 32767.0f));
+}
+
+// Toggle aim (kk_toggle_aim): each press of the game's left trigger flips it
+// between released and fully held, per pad. Start or Back (the pause menu and
+// map) and unplugging the pad release it, so a menu never opens mid-aim and
+// the gun is lowered when play resumes.
+struct AimToggle {
+  bool held = false;      // what the game is told
+  bool was_down = false;  // the trigger last poll, to catch new presses
+};
+AimToggle g_aim[4];
+
+uint8_t ToggleAim(uint32_t user, uint8_t lt, uint16_t buttons) {
+  AimToggle& aim = g_aim[user & 3];
+  if (!REXCVAR_GET(kk_toggle_aim)) {
+    aim = {};
+    return lt;
+  }
+  const bool down = lt > kTriggerPressThreshold;
+  if (down && !aim.was_down) aim.held = !aim.held;
+  aim.was_down = down;
+  constexpr uint16_t kStart = 0x0010, kBack = 0x0020;
+  if (buttons & (kStart | kBack)) aim.held = false;
+  return aim.held ? 255 : 0;
+}
+
+void Remap(uint32_t user, uint8_t* state) {
+  using kk::Pad;
+  const uint16_t in_buttons = LoadBE<uint16_t>(state + 4);
+  const uint8_t in_lt = state[6], in_rt = state[7];
+
+  uint16_t out_buttons = 0;
+  uint8_t out_lt = 0, out_rt = 0;
+  for (size_t i = 0; i < kk::kPadCount; ++i) {
+    const auto physical = static_cast<Pad>(i);
+    uint8_t analog;  // 0..255 strength of the physical control
+    if (physical == Pad::kLeftTrigger) {
+      analog = in_lt;
+    } else if (physical == Pad::kRightTrigger) {
+      analog = in_rt;
+    } else {
+      analog = (in_buttons & kk::GetPadInfo(physical).mask) ? 255 : 0;
+    }
+    if (analog == 0) continue;
+
+    const Pad target = kk::GetMapping(physical);
+    if (target == Pad::kNone) continue;
+    if (target == Pad::kLeftTrigger) {
+      out_lt = std::max(out_lt, analog);
+    } else if (target == Pad::kRightTrigger) {
+      out_rt = std::max(out_rt, analog);
+    } else if (analog > kTriggerPressThreshold) {
+      out_buttons |= kk::GetPadInfo(target).mask;
+    }
+  }
+  StoreBE<uint16_t>(state + 4, out_buttons);
+  state[6] = ToggleAim(user, out_lt, out_buttons);
+  state[7] = out_rt;
+
+  if (REXCVAR_GET(kk_invert_ls_x)) Invert(state + 8);
+  if (REXCVAR_GET(kk_invert_ls_y)) Invert(state + 10);
+  if (REXCVAR_GET(kk_invert_rs_x)) Invert(state + 12);
+  if (REXCVAR_GET(kk_invert_rs_y)) Invert(state + 14);
+
+  const float deadzone = std::clamp(REXCVAR_GET(kk_deadzone), 0, 50) / 100.0f;
+  ShapeStick(state + 8, deadzone, 1.0f);
+  ShapeStick(state + 12, deadzone, 1.0f);
+}
+
+}  // namespace
+
+namespace kk {
+// Set by developer builds (dev_tools.cpp) to feed in pad input; returns true
+// when it filled in the state.
+bool (*g_dev_pad_input)(uint32_t user, uint8_t* state) = nullptr;
+// Developer builds: sees, and may change, each pad state the
+// game reads, after everything else.
+void (*g_dev_pad_filter)(uint32_t user, uint8_t* state) = nullptr;
+}  // namespace kk
+
+REX_EXTERN(__imp__sub_821074E8);
+REX_HOOK_RAW(sub_821074E8) {
+  const uint32_t user = ctx.r3.u32;
+  const uint32_t state_ptr = ctx.r4.u32;
+  __imp__sub_821074E8(ctx, base);
+  struct ObjectPadRead {
+    uint32_t user; const uint8_t* state; PPCContext& ctx;
+    ~ObjectPadRead() {
+      kk::coop::ObjectsPad(user,state,ctx.r3.u32==0 &&
+          !kk::freecam::Active() && !kk::menu_scene::Active());
+    }
+  } object_pad_read{user,state_ptr ? base+state_ptr : nullptr,ctx};
+  if (kk::input_diag::Enabled() && !user)
+    kk::input_diag::Begin(user, ctx.r3.u32, state_ptr && !ctx.r3.u32 ? base + state_ptr : nullptr,
+        int32_t(LoadBE<uint32_t>(base+0x82C63704)),LoadBE<uint32_t>(base+0x82CCAE2C));
+  struct InputDiagnosticEnd {
+    uint32_t user; const uint8_t* state; PPCContext& ctx;
+    ~InputDiagnosticEnd() { kk::input_diag::Stage(user,"game-final",ctx.r3.u32 ? nullptr : state,ctx.r3.u32); }
+  } diagnostic_end{user,state_ptr ? base+state_ptr : nullptr,ctx};
+#if defined(KK_DEV_TOOLS)
+  DevInputTrace input_trace{user,state_ptr ? base+state_ptr : nullptr,base,ctx};
+#endif
+  // The live menu scene behind the launcher (task 330): no controller reaches the game, only the port's Start
+  // on the title.
+  if (kk::menu_scene::Active() && state_ptr) {
+    ctx.r3.u64 = kk::menu_scene::GuestPad(user, base, base + state_ptr);
+    return;
+  }
+  struct RecordRead {
+    uint32_t user; const uint8_t* state; PPCContext& ctx; const uint8_t* base;
+    ~RecordRead() { kk::benchmark::PadRead(user, state, ctx.r3.u32, base); }
+  } record_read{user, state_ptr ? base + state_ptr : nullptr, ctx, base};
+  if (kk::freecam::Active() && state_ptr) {
+    bool connected = ctx.r3.u32 == 0;
+    if (kk::g_dev_pad_input && kk::g_dev_pad_input(user, base + state_ptr))
+      connected = true;
+#if defined(KK_DEV_TOOLS)
+    if (kk::freecam::DevPadInput(user, base + state_ptr)) connected = true;
+#endif
+    kk::freecam::Pad(user, base + state_ptr, connected);
+    kk::input_diag::Stage(user,"free-camera",base+state_ptr);
+    g_aim[user & 3] = {};
+    ctx.r3.u64 = 0;
+    return;
+  }
+  uint32_t replay_status = ctx.r3.u32;  // the player's own read, for a cancel press
+  if (state_ptr && kk::benchmark::Pad(user, base + state_ptr, replay_status)) {
+    ctx.r3.u64 = replay_status;
+    kk::input_diag::Stage(user,"benchmark",base+state_ptr,replay_status);
+    return;
+  }
+  const bool dev_input = kk::g_dev_pad_input && state_ptr && kk::g_dev_pad_input(user, base + state_ptr);
+#if defined(KK_DEV_TOOLS)
+  const bool coop_input = state_ptr && (kk::benchmark::DevCoopPad(user, base + state_ptr) ||
+      kk::coop::SessionDevFollowPad(user, base + state_ptr));
+#else
+  constexpr bool coop_input = false;
+#endif
+  if (dev_input || coop_input) {
+    // The dev virtual pad is injected AFTER the native SDL/XInput read, including
+    // its focus suppression. Do not move this behind the native success check:
+    // background tests must also work without a physical controller connected.
+    ctx.r3.u64 = 0;  // ERROR_SUCCESS: a pad is connected
+    kk::input_diag::Stage(user,"virtual-injection",base+state_ptr);
+#if defined(KK_DEV_TOOLS)
+    DevFirePadTrace fire_trace{user, base + state_ptr, base[state_ptr+6], base[state_ptr+7]};
+#endif
+    if (kk::g_dev_pad_filter) kk::g_dev_pad_filter(user, base + state_ptr);
+    kk::input_diag::Stage(user,"dev-filter",base+state_ptr);
+    if (kk::DebugOverlayFilterPad(user, base + state_ptr)) {
+      kk::input_diag::Stage(user,"debug-overlay",base+state_ptr);
+#if defined(KK_DEV_TOOLS)
+      fire_trace.stage = "overlay";
+#endif
+      g_aim[user & 3] = {};
+      return;
+    }
+#if defined(KK_DEV_TOOLS)
+    const auto filtered_rt = base[state_ptr+7];
+#endif
+    kk::play::FilterPad(user, base + state_ptr);
+#if defined(KK_DEV_TOOLS)
+    if (fire_trace.rt && !filtered_rt) fire_trace.stage = "dev-filter";
+    else if (filtered_rt && !base[state_ptr+7]) fire_trace.stage = "pause-cover";
+#endif
+    if (kk::play::OriginalMenuActive()) {  // task 333: Start on the title on the way to the original main menu
+      uint32_t result = ctx.r3.u32;
+      kk::play::OriginalMenuPad(user, base, base + state_ptr, result);
+      ctx.r3.u64 = result;
+    }
+    return;
+  }
+  if (ctx.r3.u32 == 0 && state_ptr) {  // ERROR_SUCCESS
+    if (kk::DebugOverlayFilterPad(user, base + state_ptr)) {
+      kk::input_diag::Stage(user,"debug-overlay",base+state_ptr);
+      g_aim[user & 3] = {};
+      return;
+    }
+    kk::input_diag::Stage(user,"debug-overlay",base+state_ptr);
+    Remap(user, base + state_ptr);
+    kk::input_diag::Stage(user,"remap",base+state_ptr);
+    if (kk::g_dev_pad_filter) kk::g_dev_pad_filter(user, base + state_ptr);
+    kk::input_diag::Stage(user,"dev-filter",base+state_ptr);
+    // The port's pause menu: the game reads an empty pad while it is open (pause_hooks.cpp).
+    kk::play::FilterPad(user, base + state_ptr);
+  } else {
+    g_aim[user & 3] = {};  // no pad: let go of a toggled aim
+  }
+  if (state_ptr && kk::play::OriginalMenuActive()) {  // task 333: Start on the title for the original main menu
+    uint32_t result = ctx.r3.u32;
+    kk::play::OriginalMenuPad(user, base, base + state_ptr, result);
+    ctx.r3.u64 = result;
+  }
+}
+
+// sub_821074F8 is the title's XInputSetState(user, vibration) wrapper; scale or
+// drop the guest XINPUT_VIBRATION {u16 left, u16 right} before it is applied.
+REX_EXTERN(__imp__sub_821074F8);
+REX_HOOK_RAW(sub_821074F8) {
+  // Above 100% makes the game's rumble stronger than on the Xbox 360, up to the
+  // motors' full speed (its guns pulse the big motor at 48% for the machine
+  // gun and 78% for the shotgun). The game's own values are put back after the
+  // call, so a structure it sends again isn't scaled twice.
+  const uint32_t vib = ctx.r4.u32;
+  uint16_t game_speed[2] = {};
+  if (vib) {
+    const float strength =
+        REXCVAR_GET(kk_vibration) ? std::clamp(REXCVAR_GET(kk_vibration_strength), 0, 200) / 100.0f : 0.0f;
+    for (uint32_t i = 0; i < 2; ++i) {
+      uint8_t* motor = base + vib + i * 2;
+      game_speed[i] = LoadBE<uint16_t>(motor);
+      StoreBE<uint16_t>(motor, static_cast<uint16_t>(std::min(65535.0f, game_speed[i] * strength)));
+    }
+  }
+#if defined(KK_DEV_TOOLS)
+  // KK_DEV_RUMBLE_TRACE=1: log each change of the game's motor speeds, and what was sent.
+  static const bool trace = std::getenv("KK_DEV_RUMBLE_TRACE") != nullptr;
+  if (trace && vib) {
+    static uint32_t last = UINT32_MAX;
+    const uint32_t both = uint32_t(game_speed[0]) << 16 | game_speed[1];
+    if (both != last)
+      REXLOG_INFO("KK dev rumble: left {} right {} (sent {} {})", game_speed[0], game_speed[1],
+                  LoadBE<uint16_t>(base + vib), LoadBE<uint16_t>(base + vib + 2));
+    last = both;
+  }
+#endif
+  __imp__sub_821074F8(ctx, base);
+  if (vib)
+    for (uint32_t i = 0; i < 2; ++i) StoreBE<uint16_t>(base + vib + i * 2, game_speed[i]);
+}
+
+// Camera response: Modern (kk_camera_modern, the default) or Original.
+// CM_Cam takes the right stick axis by axis: each axis
+// loses a 15% deadzone, then yaw follows its square and pitch its cube (and a
+// held, nearly full sideways push builds up extra yaw speed). So a diagonal is
+// clipped on both axes and the two axes answer to different curves: half way
+// up turns at 7% of the top pitch speed while half way across turns at 17% of
+// the top yaw speed, and circles feel lopsided. The stick vector CM_Cam reads
+// (its sub_8272C610 call) is reshaped so that, after the game's own steps,
+// both axes follow the same curve of the push's length (its square) in the
+// push's direction. A full push straight across or straight up is unchanged.
+// Original leaves the stick as the game reads it.
+namespace {
+constexpr uint32_t kCamStickReturn = 0x824703A8;  // CM_Cam's right-stick read
+constexpr uint32_t kVentureTutorialReturn = 0x82432D0C;  // Chaloupe_CineD1's vertical sighting choice
+constexpr float kCamDeadzone = 0.15f;             // CM_Cam's own, per axis
+
+template <typename F>
+float Reshape(float v, float share, F root) {  // share: this axis's part of the wanted speed, 0..1
+  if (v == 0.0f) return 0.0f;
+  return std::copysign(kCamDeadzone + (1.0f - kCamDeadzone) * root(share), v);
+}
+
+void EvenCameraStick(uint8_t* base, uint32_t out) {
+  float x = LoadF(base + out), y = LoadF(base + out + 4);
+  const float r = std::sqrt(x * x + y * y);
+  if (r < 1e-4f) return;
+  const float len = std::min(r, 1.0f), speed = len * len;  // the same curve for any direction
+  const float sx = speed * std::fabs(x) / r, sy = speed * std::fabs(y) / r;
+  StoreF(base + out, Reshape(x, sx, [](float a) { return std::sqrt(a); }));     // yaw squares it
+  StoreF(base + out + 4, Reshape(y, sy, [](float a) { return std::cbrt(a); }));  // pitch cubes it
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_8272C610);
+REX_HOOK_RAW(sub_8272C610) {
+  const uint32_t out = ctx.r3.u32, stick = ctx.r4.u32, from = uint32_t(ctx.lr);
+  __imp__sub_8272C610(ctx, base);
+  if (stick != 1 || !out) return;
+  if (from==kVentureTutorialReturn) {
+    if (kk::play::CoverScreen() || kk::play::PauseMenuOpen() || kk::coop::observer::SuppressLook()) return;
+    float y=LoadF(base+out+4);
+    kk::mouse_look::OnVentureTutorialStick(y);
+    StoreF(base+out+4,y);
+    return;
+  }
+  if (from != kCamStickReturn) return;
+  if (REXCVAR_GET(kk_camera_modern)) EvenCameraStick(base, out);
+  // Keyboard & mouse: the mouse's turn this frame (mouse_look.cpp).
+  float x = LoadF(base + out), y = LoadF(base + out + 4);
+  kk::mouse_look::OnCameraStick(x, y);
+  if (kk::coop::observer::SuppressLook()) x=y=0;
+  StoreF(base + out, x);
+  StoreF(base + out + 4, y);
+}
+
+// Controller sensitivity. The camera manager (CM_Cam, sub_8246F180) reads the
+// right stick, limits it to -1..1, and turns the camera each frame by
+//   yaw:   (x past the deadzone)^2 * a ramp that builds while held * frame time * G[19880]
+//   pitch: (y past the deadzone)^3 * a speed * frame time * G[19884]
+// through sub_82711950 (yaw) and sub_82712300 (pitch). Both are used all over
+// the game, so only the calls from CM_Cam (return addresses below) are
+// scaled. That scales the turn at every push, a full push included, so 200%
+// turns twice as fast. Keyboard & mouse has its own mouse sensitivity, and the
+// mouse's turn is put in here too (mouse_look.cpp).
+namespace {
+constexpr uint32_t kCamYawReturn = 0x82471360, kCamPitchReturn = 0x82471430;
+
+double CameraGain() {
+  if (rex::cvar::GetFlagByName("mnk_mode") == "true") return 1.0;
+  return std::clamp(REXCVAR_GET(kk_camera_sensitivity), 10, 400) / 100.0;
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_82711950);
+REX_HOOK_RAW(sub_82711950) {
+  if (uint32_t(ctx.lr) == kCamYawReturn) ctx.f1.f64 = kk::mouse_look::Yaw(ctx.f1.f64 * CameraGain());
+  if (uint32_t(ctx.lr) == kCamYawReturn && kk::coop::observer::SuppressLook()) ctx.f1.f64=0;
+  __imp__sub_82711950(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_82712300);
+REX_HOOK_RAW(sub_82712300) {
+  if (uint32_t(ctx.lr) == kCamPitchReturn) ctx.f1.f64 = kk::mouse_look::Pitch(ctx.f1.f64 * CameraGain());
+  if (uint32_t(ctx.lr) == kCamPitchReturn && kk::coop::observer::SuppressLook()) ctx.f1.f64=0;
+  __imp__sub_82712300(ctx, base);
+}

@@ -1,0 +1,662 @@
+// GameRenderer: clears, resolves, Present and the blits behind them.
+
+#include <algorithm>
+#include <cstring>
+
+#include "backend/game_renderer.h"
+#include "backend/game_upscale.h"
+#include "backend/guest_layout.h"
+#include "backend/log.h"
+#include "kknr/nvrhi_format.h"
+#include "kknr/render_targets.h"
+#include "kknr/resolve.h"
+
+namespace nr {
+
+namespace {
+
+inline uint64_t Mix64(uint64_t h, uint64_t v) {
+  h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+  h *= 0xFF51AFD7ED558CCDull;
+  return h ^ (h >> 29);
+}
+
+struct BlitConstants {
+  int32_t src_rect[4];
+  uint32_t channels[4];
+  uint32_t flags[4];
+};
+static_assert(sizeof(BlitConstants) == 48);
+
+struct ClearConstants {
+  float color[4];
+  float depth;
+  float pad[3];
+};
+static_assert(sizeof(ClearConstants) == 32);
+
+// The texture object's fetch constant (object + 16) as the GPU would see it:
+// the base and mip addresses are CPU addresses in the object, physical in the
+// device copy SetTexture makes (d3d-structs.md).
+kknr::TextureFetch FetchFromObject(const uint8_t* object) {
+  uint32_t w[6];
+  for (int i = 0; i < 6; ++i) w[i] = LoadBE32(object + 16 + 4 * i);
+  if (w[1] & 0xFFFFF000u) w[1] = (w[1] & 0xFFFu) | (CpuToPhysical(w[1] & 0xFFFFF000u) & 0xFFFFF000u);
+  if (w[5] & 0xFFFFF000u) w[5] = (w[5] & 0xFFFu) | (CpuToPhysical(w[5] & 0xFFFFF000u) & 0xFFFFF000u);
+  return kknr::TextureFetch::FromWords(w);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------- blits
+
+bool GameRenderer::Blit(nvrhi::ICommandList* cl, nvrhi::ITexture* source, int32_t sx, int32_t sy, int32_t w,
+                        int32_t h, nvrhi::ITexture* dest, uint32_t dest_level, uint32_t dest_slice,
+                        int32_t dx, int32_t dy, const uint32_t channels[4], uint32_t blit_flags,
+                        uint32_t blit_arg, int32_t dest_width, int32_t dest_height,
+                        nvrhi::IFramebuffer* prepared_framebuffer, nvrhi::IBindingSet* prepared_set) {
+  if (w <= 0 || h <= 0) return false;
+  EnsureFallbackResources(cl);
+  nvrhi::FramebufferDesc fd;
+  fd.addColorAttachment(nvrhi::FramebufferAttachment().setTexture(dest).setMipLevel(dest_level).setArraySlice(dest_slice));
+  uint64_t fb_key = Mix64(Mix64(0xB117, reinterpret_cast<uintptr_t>(dest)), (uint64_t(dest_level) << 32) | dest_slice);
+  if (!prepared_framebuffer) framebuffer_used_[fb_key] = frame_;
+  nvrhi::IFramebuffer* fb = prepared_framebuffer;
+  if (fb) {
+    // Budget migration prepared its views on an earlier frame.
+  } else if (auto it = framebuffers_.find(fb_key); it != framebuffers_.end()) {
+    fb = it->second;
+  } else {
+    nvrhi::FramebufferHandle h2 = device_->createFramebuffer(fd);
+    if (!h2) return false;
+    framebuffers_[fb_key] = h2;
+    fb = h2;
+  }
+  const nvrhi::Format format = dest->getDesc().format;
+  const uint64_t pipe_key = Mix64(0xB1170000, uint64_t(format));
+  nvrhi::GraphicsPipelineDesc pd;
+  pd.primType = nvrhi::PrimitiveType::TriangleList;
+  pd.VS = blit_vs_;
+  pd.PS = blit_ps_;
+  pd.bindingLayouts = {blit_layout_};
+  pd.renderState.depthStencilState.depthTestEnable = false;
+  pd.renderState.depthStencilState.depthWriteEnable = false;
+  pd.renderState.rasterState.cullMode = nvrhi::RasterCullMode::None;
+  pd.renderState.rasterState.scissorEnable = true;
+  nvrhi::IGraphicsPipeline* pipeline = GetPipeline(pd, fb, pipe_key);
+  if (!pipeline) return false;
+  nvrhi::IBindingSet* set = prepared_set;
+  if (set) {
+    // The source version is checked again before committing the migration.
+  } else if (auto it = blit_sets_.find(source); it != blit_sets_.end()) {
+    set = it->second;
+  } else {
+    nvrhi::BindingSetDesc bs;
+    bs.bindings = {nvrhi::BindingSetItem::PushConstants(0, sizeof(BlitConstants)),
+                   nvrhi::BindingSetItem::Texture_SRV(0, source, nvrhi::Format::UNKNOWN,
+                                                      nvrhi::TextureSubresourceSet(0, 1, 0, 1)),
+                   nvrhi::BindingSetItem::Texture_SRV(1, gamma_ramp_)};
+    nvrhi::BindingSetHandle handle = device_->createBindingSet(bs, blit_layout_);
+    if (!handle) return false;
+    blit_sets_[source] = handle;
+    set = handle;
+  }
+  nvrhi::GraphicsState gs;
+  gs.pipeline = pipeline;
+  gs.framebuffer = fb;
+  gs.bindings = {set};
+  const int32_t dw = dest_width > 0 ? dest_width : w, dh = dest_height > 0 ? dest_height : h;
+  gs.viewport.addViewport(nvrhi::Viewport(float(dx), float(dx + dw), float(dy), float(dy + dh), 0.0f, 1.0f));
+  gs.viewport.addScissorRect(nvrhi::Rect(dx, dx + dw, dy, dy + dh));
+  cl->setGraphicsState(gs);
+  BlitConstants c = {{sx, sy, w, h}, {channels[0], channels[1], channels[2], channels[3]}, {blit_flags, blit_arg, 0, 0}};
+  cl->setPushConstants(&c, sizeof(c));
+  nvrhi::DrawArguments args;
+  args.vertexCount = 3;
+  cl->draw(args);
+  return true;
+}
+
+void GameRenderer::ClearRect(nvrhi::ICommandList* cl, HostTarget* color, HostTarget* depth,
+                             const nvrhi::Rect& rect_in, const float rgba[4], bool clear_color,
+                             bool clear_depth, bool clear_stencil, float z, uint32_t stencil) {
+  if (!color) clear_color = false;
+  if (!depth) clear_depth = clear_stencil = false;
+  if (!clear_color && !clear_depth && !clear_stencil) return;
+  // Clear() obtains each EDRAM placement at its own retained size. A partial
+  // startup clear can therefore pair a taller colour surface with a shorter
+  // depth surface. Clears have no dependency between those attachments: issue
+  // each with its own viewport/scissor instead of binding an invalid framebuffer
+  // or growing a target (which would discard its previous contents).
+  if (color && depth && (color->host_width != depth->host_width ||
+                         color->host_height != depth->host_height ||
+                         color->scale_x != depth->scale_x || color->scale_y != depth->scale_y)) {
+    ClearRect(cl, color, nullptr, rect_in, rgba, clear_color, false, false, z, stencil);
+    ClearRect(cl, nullptr, depth, rect_in, rgba, false, clear_depth, clear_stencil, z, stencil);
+    return;
+  }
+  const HostTarget* size_from = color ? color : depth;
+  nvrhi::Rect rect = rect_in;
+  rect.minX = std::clamp(rect.minX, 0, int(size_from->width));
+  rect.maxX = std::clamp(rect.maxX, rect.minX, int(size_from->width));
+  rect.minY = std::clamp(rect.minY, 0, int(size_from->height));
+  rect.maxY = std::clamp(rect.maxY, rect.minY, int(size_from->height));
+  if (rect.minX == rect.maxX || rect.minY == rect.maxY) return;
+  ++stats_.clears;
+  const bool whole = rect.minX == 0 && rect.minY == 0 && rect.maxX == int(size_from->width) &&
+                     rect.maxY == int(size_from->height);
+  if (whole) {
+    if (clear_color) {
+      color->clear_only = true;
+      color->saved_color = nvrhi::Color(rgba[0], rgba[1], rgba[2], rgba[3]);
+    }
+    if (clear_depth || clear_stencil) {
+      // A one-aspect clear cannot describe the other aspect's contents.
+      depth->clear_only = clear_depth && clear_stencil;
+      depth->saved_depth = std::clamp(z, 0.0f, 1.0f);
+      depth->saved_stencil = uint8_t(stencil);
+    }
+    if (clear_color)
+      cl->clearTextureFloat(color->texture, nvrhi::AllSubresources, nvrhi::Color(rgba[0], rgba[1], rgba[2], rgba[3]));
+    if (clear_depth || clear_stencil)
+      cl->clearDepthStencilTexture(depth->texture, nvrhi::AllSubresources, clear_depth, std::clamp(z, 0.0f, 1.0f),
+                                   clear_stencil, uint8_t(stencil));
+    return;
+  }
+  // Part of the target: a triangle at the clear depth under the scissor.
+  std::array<HostTarget*, 4> colors{};
+  colors[0] = color;
+  nvrhi::IFramebuffer* fb = GetFramebuffer(colors, depth);
+  if (!fb) return;
+  nvrhi::GraphicsPipelineDesc pd;
+  pd.primType = nvrhi::PrimitiveType::TriangleList;
+  pd.VS = clear_vs_;
+  pd.PS = clear_ps_;
+  pd.bindingLayouts = {clear_layout_};
+  pd.renderState.rasterState.cullMode = nvrhi::RasterCullMode::None;
+  pd.renderState.rasterState.scissorEnable = true;
+  pd.renderState.rasterState.depthClipEnable = false;
+  pd.renderState.blendState.targets[0].colorWriteMask = clear_color ? nvrhi::ColorMask::All : nvrhi::ColorMask(0);
+  auto& ds = pd.renderState.depthStencilState;
+  ds.depthTestEnable = clear_depth;
+  ds.depthWriteEnable = clear_depth;
+  ds.depthFunc = nvrhi::ComparisonFunc::Always;
+  ds.stencilEnable = clear_stencil;
+  ds.stencilWriteMask = 0xFF;
+  ds.dynamicStencilRef = true;
+  ds.frontFaceStencil.stencilFunc = nvrhi::ComparisonFunc::Always;
+  ds.frontFaceStencil.passOp = nvrhi::StencilOp::Replace;
+  ds.backFaceStencil = ds.frontFaceStencil;
+  uint64_t key = Mix64(FormatSignature(colors, depth), 0xC1EA);
+  key = Mix64(key, (clear_color ? 1 : 0) | (clear_depth ? 2 : 0) | (clear_stencil ? 4 : 0));
+  nvrhi::IGraphicsPipeline* pipeline = GetPipeline(pd, fb, key);
+  if (!pipeline) return;
+  nvrhi::GraphicsState gs;
+  gs.pipeline = pipeline;
+  gs.framebuffer = fb;
+  gs.bindings = {clear_set_};
+  gs.viewport.addViewport(nvrhi::Viewport(float(size_from->host_width), float(size_from->host_height)));
+  gs.viewport.addScissorRect(ScaleRect(rect, size_from->scale_x, size_from->scale_y));
+  gs.dynamicStencilRefValue = uint8_t(stencil);
+  cl->setGraphicsState(gs);
+  ClearConstants c = {{rgba[0], rgba[1], rgba[2], rgba[3]}, std::clamp(z, 0.0f, 1.0f), {0, 0, 0}};
+  cl->setPushConstants(&c, sizeof(c));
+  nvrhi::DrawArguments args;
+  args.vertexCount = 3;
+  cl->draw(args);
+}
+
+// ---------------------------------------------------------------- clear
+
+void GameRenderer::Clear(nvrhi::ICommandList* cl, const ClearCall& call) {
+  UpdateEffects();
+  if (options_.debug & 1024) return;  // debugging: no clears
+  dev::DeviceView d(call.device ? memory_.Virtual(call.device) : nullptr);
+  if (!d.valid() || !(call.color || call.depth || call.stencil)) return;
+  if (frame_log_ && frame_log_->enabled()) LogClear(call, d);
+  ProcessInvalidations();
+  const uint32_t pitch = d.u32(dev::kRbSurfaceInfo) & 0x3FFF;
+  if (!pitch) return;
+  current_cl_ = cl;
+  if (upscale_) {
+    // Upscalers (game_upscale.cpp): a clear of part of the scene's target is an upscale point.
+    uint64_t color_key = 0, depth_key = 0;
+    if ((call.flags & 1) && d.u32(dev::kRenderTargets)) {
+      const uint32_t info = d.u32(dev::kRbColorInfo);
+      color_key = TargetKeyOf(false, info & 0xFFF, pitch, (info >> 16) & 0xF);
+    }
+    if ((call.depth || call.stencil) && call.depth_stencil) {
+      const uint32_t info = d.u32(dev::kRbDepthInfo);
+      depth_key = TargetKeyOf(true, info & 0xFFF, pitch, (info >> 16) & 1);
+    }
+    bool covers = true;
+    for (uint32_t r = 0; r < call.rect_count; ++r) {
+      if (call.rects[r][0] > 0 || call.rects[r][1] > 0 || call.rects[r][2] < int32_t(pitch) ||
+          call.rects[r][3] < int32_t(options_.guest_frame_height))
+        covers = false;
+    }
+    if (!call.rect_count) {
+      const int32_t vw = int32_t(d.u32(dev::kViewport + 8)), vh = int32_t(d.u32(dev::kViewport + 12));
+      covers = vw >= int32_t(pitch) && vh >= int32_t(options_.guest_frame_height);
+    }
+    UpscaleBeginClear(cl, call, color_key, depth_key, covers);
+  }
+  uint32_t height = 0;
+  HostTarget* colors[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!(call.flags & (1u << i))) continue;
+    const uint32_t surface = d.u32(dev::kRenderTargets + 4 * i);
+    dev::SurfaceInfo s;
+    if (!surface || !dev::DecodeSurface(memory_.Virtual(surface), false, s)) continue;
+    const uint32_t info = d.u32(i == 0 ? dev::kRbColorInfo : dev::kRbColor1Info + 4 * (i - 1));
+    HostTarget* existing = FindTarget(false, info & 0xFFF, pitch, (info >> 16) & 0xF);
+    colors[i] = GetTarget(false, info & 0xFFF, pitch, (info >> 16) & 0xF,
+                          std::max(s.height, existing ? existing->height : 0u));
+    if (colors[i]) height = std::max(height, colors[i]->height);
+  }
+  HostTarget* depth = nullptr;
+  if ((call.depth || call.stencil) && call.depth_stencil) {
+    dev::SurfaceInfo s;
+    if (dev::DecodeSurface(memory_.Virtual(call.depth_stencil), true, s)) {
+      const uint32_t info = d.u32(dev::kRbDepthInfo);
+      HostTarget* existing = FindTarget(true, info & 0xFFF, pitch, (info >> 16) & 1);
+      depth = GetTarget(true, info & 0xFFF, pitch, (info >> 16) & 1,
+                        std::max(s.height, existing ? existing->height : 0u));
+    }
+  }
+  PostSplitTarget(cl, colors[0] ? colors[0] : depth, 'c');  // dev aid (KK_DEV_POST_SPLIT)
+  if (scene_ao_) AoClearHook(call, depth);  // AO hook (game_ao.cpp): the scene's depth is cleared
+  if (scene_gi_) GiClearHook(call, depth);  // GI hook (game_gi.cpp)
+  if (scene_cel_) CelClearHook(call, depth);  // Cel hook (game_cel.cpp)
+  if (scene_photo_) PhotoClearHook(call, depth);  // Photo hook (game_photo.cpp)
+  if (scene_lighting_ && call.depth && depth) scene_lighting_->OnDepthClear(call.frame, depth->key);
+  // The rectangles, or the viewport (the device's, after its clamp).
+  std::vector<nvrhi::Rect> rects;
+  for (uint32_t r = 0; r < call.rect_count; ++r)
+    rects.emplace_back(call.rects[r][0], call.rects[r][2], call.rects[r][1], call.rects[r][3]);
+  if (rects.empty()) {
+    const int32_t x = int32_t(d.u32(dev::kViewport)), y = int32_t(d.u32(dev::kViewport + 4));
+    const int32_t w = int32_t(d.u32(dev::kViewport + 8)), h = int32_t(d.u32(dev::kViewport + 12));
+    rects.emplace_back(x, x + w, y, y + h);
+  }
+  float rgba[4] = {call.rgba[0], call.rgba[1], call.rgba[2], call.rgba[3]};
+  if (options_.debug & 1) {
+    rgba[0] = rgba[2] = 0.0f;
+    rgba[1] = rgba[3] = 1.0f;
+  }
+  for (const nvrhi::Rect& rect : rects) {
+    bool depth_done = false;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (!colors[i]) continue;
+      ClearRect(cl, colors[i], depth_done ? nullptr : depth, rect, rgba, true, call.depth && !depth_done,
+                call.stencil && !depth_done, call.z, call.stencil_value);
+      depth_done = depth != nullptr;
+    }
+    if (!depth_done && depth)
+      ClearRect(cl, nullptr, depth, rect, call.rgba, false, call.depth, call.stencil, call.z, call.stencil_value);
+  }
+  if (Dump(call.frame)) {
+    Logf(LogLevel::kInfo, "rexgpu-native: clear flags %X rgba %.3f %.3f %.3f %.3f z %.3f rects %zu", call.flags,
+         call.rgba[0], call.rgba[1], call.rgba[2], call.rgba[3], call.z, rects.size());
+  }
+  (void)height;
+}
+
+// ---------------------------------------------------------------- resolve
+
+bool GameRenderer::ResolveCopy(nvrhi::ICommandList* cl, HostTarget* source, bool from_depth, uint32_t format, int32_t sx,
+                               int32_t sy, int32_t w, int32_t h, const kknr::TextureFetch& fetch, int32_t dx,
+                               int32_t dy, uint32_t level, uint32_t slice) {
+  kknr::HostTexturePlan plan;
+  if (fetch.Type() != 2 || !kknr::PlanHostTexture(fetch, plan, nullptr, TextureOptions())) return false;
+  // The source's scale: the resolved texture gets it, and every rectangle below is in host pixels.
+  const float tsx = source->scale_x, tsy = source->scale_y;
+  kknr::TextureCache::Entry& entry = textures_.MarkGpuWritten(fetch, frame_);
+  const bool drawable = kknr::GetHostFormatInfo(plan.format).block_size == 1;
+  HostTexture* host = ResolveDestTexture(entry, plan, drawable, tsx, tsy);
+  if (!host) return false;
+  bool copied = false;
+  const int32_t dw = int32_t(std::max(plan.width >> level, 1u)), dh = int32_t(std::max(plan.height >> level, 1u));
+  const int32_t cw = std::min(w, dw - dx), ch = std::min(h, dh - dy);
+  // Copy or blit, and the blit's channels: kknr::PlanResolveConversion
+  // (docs/formats.md, "Resolves"); its CPU reference is tested
+  // against ConvertTexture of what the 360 writes to memory.
+  const kknr::ResolveConversion conv =
+      kknr::PlanResolveConversion(kknr::ResolveSource{from_depth, format}, fetch, TextureOptions());
+  // Host pixels. The size is the same on both sides (the origins round on their own).
+  const nvrhi::TextureDesc& hd = host->texture->getDesc();
+  const int32_t hdw = int32_t(std::max(hd.width >> level, 1u)), hdh = int32_t(std::max(hd.height >> level, 1u));
+  const int32_t hsx = ScaleCoord(sx, tsx), hsy = ScaleCoord(sy, tsy);
+  const int32_t hdx = ScaleCoord(dx, host->scale_x), hdy = ScaleCoord(dy, host->scale_y);
+  const int32_t hcw = std::min({ScaleCoord(cw, tsx), hdw - hdx, int32_t(source->host_width) - hsx});
+  const int32_t hch = std::min({ScaleCoord(ch, tsy), hdh - hdy, int32_t(source->host_height) - hsy});
+  if (cw > 0 && ch > 0 && hcw > 0 && hch > 0 && slice < plan.layers && level < plan.levels) {
+    const bool bytes_to_depth =
+        !from_depth && format == 0 && host->format == nvrhi::Format::R32_FLOAT &&
+        (fetch.Format() == kknr::TextureFormat::k_24_8 || fetch.Format() == kknr::TextureFormat::k_24_8_FLOAT);
+    host->depth = from_depth;
+    if (bytes_to_depth && host->render_target) {
+      // A colour target holding a depth buffer's bytes (the light shafts
+      // copy the depth, seen as 8:8:8:8, into a smaller target) resolved
+      // into a depth texture: the 360 copies the 32-bit word, with R and
+      // B exchanged, and the texture reads its top 24 bits.
+      const uint32_t identity[4] = {0, 1, 2, 3};
+      copied = Blit(cl, source->texture, hsx, hsy, hcw, hch, host->texture, level, slice, hdx, hdy, identity,
+                    kBlitBytesToDepth);
+      if (copied) host->depth = true;
+    } else if (conv.method == kknr::ResolveMethod::kUnsupported || conv.scale != 1.0f) {
+      // scale != 1: the blit has no scale (16-bit fixed targets into
+      // 16-bit textures; the game has none).
+      if (stats_.resolve_failures < 20) {
+        Logf(LogLevel::kWarning, "rexgpu-native: resolve %s format %u -> %08X %08X: %s",
+             from_depth ? "depth" : "colour", format, fetch.words[0], fetch.words[1],
+             conv.method == kknr::ResolveMethod::kUnsupported ? conv.why : "needs a scaled blit");
+      }
+    } else if (conv.method == kknr::ResolveMethod::kCopy && host->format == source->format) {
+      nvrhi::TextureSlice src_slice, dst_slice;
+      src_slice.setOrigin(uint32_t(hsx), uint32_t(hsy)).setSize(uint32_t(hcw), uint32_t(hch), 1);
+      dst_slice.setOrigin(uint32_t(hdx), uint32_t(hdy)).setSize(uint32_t(hcw), uint32_t(hch), 1)
+          .setMipLevel(level)
+          .setArraySlice(slice);
+      cl->copyTexture(host->texture, dst_slice, source->texture, src_slice);
+      copied = true;
+    } else if (host->render_target) {
+      const uint32_t channels[4] = {conv.channels[0], conv.channels[1], conv.channels[2], conv.channels[3]};
+      copied = Blit(cl, source->texture, hsx, hsy, hcw, hch, host->texture, level, slice, hdx, hdy, channels);
+    }
+    cl->setTextureState(host->texture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+    if (copied) {
+      host->serial = ++resolve_serial_;
+      resolved_by_base_[fetch.BaseAddress()] = &entry;
+    }
+  }
+  return copied;
+}
+
+void GameRenderer::Resolve(nvrhi::ICommandList* cl, const ResolveCall& call) {
+  UpdateEffects();
+  if (options_.debug & 2048) return;  // debugging: no resolves
+  dev::DeviceView d(call.device ? memory_.Virtual(call.device) : nullptr);
+  if (!d.valid()) return;
+  if (frame_log_ && frame_log_->enabled()) LogResolve(call, d);
+  ProcessInvalidations();
+  ++stats_.resolves;
+  const kknr::ResolveFlags flags{call.flags};
+  const uint32_t pitch = d.u32(dev::kRbSurfaceInfo) & 0x3FFF;
+  const bool from_depth = flags.DepthStencil();
+  const uint32_t index = flags.RenderTargetIndex();
+  const uint32_t surface = from_depth ? call.depth_stencil : call.render_targets[index];
+  dev::SurfaceInfo s;
+  if (!pitch || !surface || !dev::DecodeSurface(memory_.Virtual(surface), from_depth, s)) {
+    ++stats_.resolve_failures;
+    return;
+  }
+  const uint32_t info = from_depth ? d.u32(dev::kRbDepthInfo)
+                                   : d.u32(index == 0 ? dev::kRbColorInfo : dev::kRbColor1Info + 4 * (index - 1));
+  const uint32_t base = info & 0xFFF, format = from_depth ? (info >> 16) & 1 : (info >> 16) & 0xF;
+  current_cl_ = cl;
+  // Upscalers (game_upscale.cpp): a copy that clears the scene's target is an upscale point.
+  if (upscale_) UpscaleBeginResolve(cl, call, TargetKeyOf(from_depth, base, pitch, format), !from_depth && flags.ClearRenderTarget());
+  HostTarget* source = FindTarget(from_depth, base, pitch, format);
+  if (!source) {
+    // Never drawn: the 360 would copy whatever EDRAM held. Make it (cleared).
+    source = GetTarget(from_depth, base, pitch, format, s.height);
+    if (!source) {
+      ++stats_.resolve_failures;
+      return;
+    }
+  }
+  PostSplitTarget(cl, source, 'r');  // dev aid (KK_DEV_POST_SPLIT)
+  int32_t sx = 0, sy = 0, w = int32_t(s.width), h = int32_t(s.height);
+  if (call.has_rect) {
+    sx = call.rect[0];
+    sy = call.rect[1];
+    w = call.rect[2] - call.rect[0];
+    h = call.rect[3] - call.rect[1];
+  }
+  sx = std::clamp(sx, 0, int32_t(source->width));
+  sy = std::clamp(sy, 0, int32_t(source->height));
+  w = std::clamp(w, 0, int32_t(source->width) - sx);
+  h = std::clamp(h, 0, int32_t(source->height) - sy);
+
+  // The source's scale: the resolved texture gets it, and every rectangle below is in host
+  // pixels (the guest's times it; the clears further down take the guest's).
+  const float tsx = source->scale_x, tsy = source->scale_y;
+  // Ambient occlusion: the depth resolve before lighting is noticed, and the
+  // scene colour copies after it get the occlusion multiplied in. The copy
+  // reads a scratch texture for the duration of the copy (the game's own
+  // target stays as it was).
+  nvrhi::TextureHandle ao_original;
+  if ((ao_ || scene_ao_) && options_.ao_settings) {
+    const AoSettings ao_settings = options_.ao_settings();
+    if (ao_settings.mode > 0 && call.dest_texture) {
+      const uint8_t* ao_dest = memory_.Virtual(call.dest_texture);
+      const nvrhi::TextureDesc& sd = source->texture->getDesc();
+      const int32_t guest_w = call.has_rect ? call.rect[2] - call.rect[0] : int32_t(s.width);
+      const int32_t guest_h = call.has_rect ? call.rect[3] - call.rect[1] : int32_t(s.height);
+      // The rectangle in host pixels, rounded as every other scaled rectangle is (ScaleRect: the
+      // source target's scale, each edge rounded; the AO only takes full-screen copies from 0,0).
+      AoResolve r;
+      r.frame = call.frame;
+      r.from_depth = from_depth;
+      r.full_screen = ao_dest && sx == 0 && sy == 0 && guest_w >= 1280 && guest_h >= 720;
+      r.format_ok = from_depth ? format == 0 : format <= 1;  // D24S8; 8:8:8:8 (gamma)
+      r.dest_key = ao_dest ? FetchFromObject(ao_dest).BaseAddress() : 0;
+      r.source = source->texture;
+      const nvrhi::Rect host_rect = ScaleRect(nvrhi::Rect(0, guest_w, 0, guest_h), source->scale_x, source->scale_y);
+      r.width = std::min(uint32_t(std::max(host_rect.maxX, 0)), sd.width);
+      r.height = std::min(uint32_t(std::max(host_rect.maxY, 0)), sd.height);
+      // AO hook (game_ao.cpp): the legacy method, or the GTAO method's resolve moment.
+      if (nvrhi::ITexture* scene = AoResolveHook(cl, r, ao_settings, call, source)) {
+        ao_original = source->texture;
+        source->texture = scene;
+        ++stats_.ao_applied;
+      }
+    }
+  }
+
+  if (scene_gi_) GiResolveHook(call, source, from_depth);  // GI hook (game_gi.cpp): scene copies, depth clears
+  if (scene_cel_) CelResolveHook(call);  // Cel hook (game_cel.cpp): depth clears
+  if (scene_photo_) PhotoResolveHook(call);  // Photo hook (game_photo.cpp): depth clears
+  const uint8_t* dest_object = call.dest_texture ? memory_.Virtual(call.dest_texture) : nullptr;
+  bool copied = false;
+  kknr::TextureFetch dest_fetch;
+  if (dest_object && w > 0 && h > 0) {
+    dest_fetch = FetchFromObject(dest_object);
+    const int32_t dx = call.has_point ? call.point[0] : 0, dy = call.has_point ? call.point[1] : 0;
+    copied = ResolveCopy(cl, source, from_depth, format, sx, sy, w, h, dest_fetch, dx, dy, call.dest_level,
+                         call.dest_slice);
+  }
+  if (!copied && dest_object) ++stats_.resolve_failures;
+  if (ao_original) source->texture = ao_original;  // the clears below are the game's own target's
+  // Upscalers (game_upscale.cpp): a copy of the whole scene is done again from the upscaled picture.
+  if (upscale_) UpscaleAfterResolve(call, source, from_depth, format, sx, sy, w, h, dest_object ? &dest_fetch : nullptr, copied);
+
+  // The resolve's clears, over the source rectangle.
+  if (flags.ClearRenderTarget() || flags.ClearDepthStencil()) {
+    const nvrhi::Rect rect(sx, sx + w, sy, sy + h);
+    if (flags.ClearRenderTarget() && !from_depth) {
+      const float rgba[4] = {call.has_clear_color ? call.clear_color[0] : 0.0f,
+                             call.has_clear_color ? call.clear_color[1] : 0.0f,
+                             call.has_clear_color ? call.clear_color[2] : 0.0f,
+                             call.has_clear_color ? call.clear_color[3] : 0.0f};
+      ClearRect(cl, source, nullptr, rect, rgba, true, false, false, 1.0f, 0);
+    }
+    if (flags.ClearDepthStencil() && call.depth_stencil) {
+      dev::SurfaceInfo ds;
+      if (dev::DecodeSurface(memory_.Virtual(call.depth_stencil), true, ds)) {
+        const uint32_t dinfo = d.u32(dev::kRbDepthInfo);
+        HostTarget* existing = FindTarget(true, dinfo & 0xFFF, pitch, (dinfo >> 16) & 1);
+        HostTarget* depth = GetTarget(true, dinfo & 0xFFF, pitch, (dinfo >> 16) & 1,
+                                      std::max(ds.height, existing ? existing->height : 0u));
+        const float zero[4] = {0, 0, 0, 0};
+        if (depth) ClearRect(cl, nullptr, depth, rect, zero, false, true, true, call.clear_z, 0);
+        if (depth && upscale_) upscale_->tracker.OnDepthCleared(call.frame, depth->key & ~kOutputGeneration);
+        if (depth && scene_lighting_) scene_lighting_->OnDepthClear(call.frame, depth->key);
+      }
+    }
+  }
+  if (Dump(call.frame)) {
+    Logf(LogLevel::kInfo,
+         "rexgpu-native: resolve flags %X %s base %u fmt %u pitch %u rect %d,%d %dx%d -> %08X (fetch %08X %08X %08X %08X) %s",
+         call.flags, from_depth ? "depth" : "colour", base, format, pitch, sx, sy, w, h, call.dest_texture,
+         dest_object ? LoadBE32(dest_object + 16) : 0, dest_object ? LoadBE32(dest_object + 20) : 0,
+         dest_object ? LoadBE32(dest_object + 24) : 0, dest_object ? LoadBE32(dest_object + 28) : 0,
+         copied ? "copied" : "not copied");
+  }
+}
+
+// ---------------------------------------------------------------- present
+
+bool GameRenderer::Present(nvrhi::ICommandList* cl, uint32_t device, nvrhi::ITexture* target) {
+  PollResourcePreload(cl);
+  UpdateEffects();
+  ServiceTexturePacks(cl);
+  EnsureFallbackResources(cl);
+  dev::DeviceView d(device ? memory_.Virtual(device) : nullptr);
+  if (!d.valid()) return false;
+  if (scene_lighting_) scene_lighting_->EndTimedDraws(cl);
+  if (scene_ao_ || ao_timer_) AoPresentHook(cl);  // AO hook (game_ao.cpp): a scene the moments above missed
+  if (scene_gi_) GiPresentHook(cl);  // GI hook (game_gi.cpp): the same for the bounce light
+  if (scene_cel_) CelPresentHook();  // Cel hook (game_cel.cpp): its timer (no shading at Present)
+  if (scene_lighting_) LightingPresentHook(cl);  // Lighting hook (game_lighting.cpp)
+  current_cl_ = cl;
+  // Upscalers (game_upscale.cpp): a scene that did not reach its upscale point is upscaled now; a frame
+  // drawn at the input size without a scene is carried to the output size.
+  if (upscale_) UpscaleBeginPresent(cl);
+  struct PostSplitEnd {
+    GameRenderer* r;
+    nvrhi::ICommandList* cl;
+    ~PostSplitEnd() { r->PostSplitFrameEnd(cl); }
+  } post_split_end{this, cl};  // dev aid (KK_DEV_POST_SPLIT)
+  PostSplitMark(cl, 3, "3 Present");
+  if (frame_log_ && frame_log_->enabled()) LogSwap(d);
+  const uint32_t back_buffer = d.u32(dev::kBackBuffer);
+  const uint8_t* object = back_buffer ? memory_.Virtual(back_buffer) : nullptr;
+  dev::SurfaceInfo s;
+  if (!object || !dev::DecodeSurface(object, false, s)) return false;
+  const uint32_t pitch = s.pitch ? s.pitch : s.width;
+  // Upscalers: the output generation's target (made, and given the input twin's picture, when this
+  // frame drew only at the input size).
+  HostTarget* source = upscale_ ? GetTarget(false, s.edram_base, pitch, s.format, s.height)
+                                : FindTarget(false, s.edram_base, pitch, s.format);
+  if (!source) {
+    ++stats_.presents_missing;
+    if (stats_.presents_missing < 10) {
+      Logf(LogLevel::kWarning, "rexgpu-native: Present: no host target for the back buffer %08X (base %u pitch %u format %u %ux%u)",
+           back_buffer, s.edram_base, pitch, s.format, s.width, s.height);
+    }
+    return false;
+  }
+  const nvrhi::TextureDesc& td = target->getDesc();
+  const uint32_t channels[4] = {0, 1, 2, 3};
+  if (options_.debug & 2) cl->clearTextureFloat(target, nvrhi::AllSubresources, nvrhi::Color(1.0f, 0.0f, 1.0f, 1.0f));
+  // The display gamma ramp, when the game changed it.
+  std::array<uint16_t, 768> ramp;
+  for (uint32_t i = 0; i < 768; ++i) ramp[i] = LoadBE16(d.at(dev::kGammaRamp + i * 2));
+  // The player's brightness and gamma (picture_adjust.h) go after the game's ramp; at the defaults the
+  // ramp is the game's alone (and no ramp at all when the game left it alone), exactly as before.
+  const bool game_ramp = PictureAdjust::GameRampChanged(ramp);
+  const bool picture = !picture_.identity();
+  const bool use_ramp = PictureAdjust::PresentUsesRamp(ramp, picture_) && !(options_.debug & 4);
+  if (picture && (picture_ != picture_composed_for_ || ramp != picture_composed_from_)) {
+    picture_composed_ = picture_.PresentRamp(ramp);  // only when the sliders or the game's ramp change
+    picture_composed_for_ = picture_;
+    picture_composed_from_ = ramp;
+  }
+  const std::array<uint16_t, 768>& effective = picture ? picture_composed_ : ramp;
+  if (use_ramp && (!gamma_ramp_uploaded_ || effective != gamma_ramp_values_)) {
+    std::array<uint16_t, 1024> texels;
+    for (uint32_t i = 0; i < 256; ++i) {
+      texels[i * 4 + 0] = effective[i];
+      texels[i * 4 + 1] = effective[256 + i];
+      texels[i * 4 + 2] = effective[512 + i];
+      texels[i * 4 + 3] = 0xFFFF;
+    }
+    cl->writeTexture(gamma_ramp_, 0, 0, texels.data(), 256 * 8);
+    cl->setTextureState(gamma_ramp_, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+    gamma_ramp_values_ = effective;
+    gamma_ramp_uploaded_ = true;
+    // The game's own ramp changes are logged; the player's sliders log in UpdateEffects instead.
+    if (!picture && game_ramp)
+      Logf(LogLevel::kInfo, "rexgpu-native: gamma ramp %u %u %u %u %u (red 0, 64, 128, 192, 255)", ramp[0], ramp[64],
+           ramp[128], ramp[192], ramp[255]);
+  }
+  // --native_show_texture=<guest address>: the texture a resolve wrote at that base instead of the
+  // back buffer (from its top left, 1:1 in host pixels), so the game's own captures show an
+  // intermediate pass.
+  if (options_.show_texture) {
+    auto it = resolved_by_base_.find(options_.show_texture & 0x1FFFF000u);
+    const auto* host = it != resolved_by_base_.end() ? static_cast<const HostTexture*>(it->second->host) : nullptr;
+    if (host && host->texture && host->render_target) {
+      const nvrhi::TextureDesc& sd = host->texture->getDesc();
+      cl->clearTextureFloat(target, nvrhi::AllSubresources, nvrhi::Color(0.0f, 0.0f, 0.0f, 1.0f));
+      return Blit(cl, host->texture, 0, 0, int32_t(std::min(sd.width, td.width)), int32_t(std::min(sd.height, td.height)),
+                  target, 0, 0, 0, 0, channels, 0);
+    }
+  }
+  // The frame image is the scaled size: the whole back buffer 1:1 in host pixels.
+  const int32_t fw = int32_t(std::min(uint32_t(ScaleCoord(int32_t(s.width), source->scale_x)), td.width));
+  const int32_t fh = int32_t(std::min(uint32_t(ScaleCoord(int32_t(s.height), source->scale_y)), td.height));
+  const int32_t pw = memory_scale_steps_ ? int32_t(td.width) : fw;
+  const int32_t ph = memory_scale_steps_ ? int32_t(td.height) : fh;
+  photo_frame_w_ = pw, photo_frame_h_ = ph;  // photo mode's grade covers this (game_photo.cpp)
+  if (cas_timer_) cas_timer_->FrameEnd();
+  // FSR's RCAS already sharpens. Never stack CAS over it. DLSS and XeSS do not expose
+  // sharpening here; spatial FSR/NIS are excluded when reading the settings.
+  const bool own_sharpening = upscale_ &&
+      (upscale_->kind == UpscalerKind::kFsr3 || upscale_->kind == UpscalerKind::kFsr4) &&
+      upscale_->config.sharpness >= 0.0f;
+  nvrhi::ITexture* post_target = target;
+  if (options_.sharpness && !own_sharpening) {
+    if (!cas_source_ || cas_source_->getDesc().width != td.width || cas_source_->getDesc().height != td.height ||
+        cas_source_->getDesc().format != td.format) {
+      nvrhi::TextureDesc cd = td;
+      cd.initialState = nvrhi::ResourceStates::ShaderResource;
+      cd.keepInitialState = true;
+      cd.isRenderTarget = true;
+      cd.debugName = "CAS source after anti-aliasing";
+      if (cas_source_) { blit_sets_.erase(cas_source_.Get()); RetireResource(cas_source_); }
+      cas_source_ = device_->createTexture(cd);
+    }
+    if (cas_source_) post_target = cas_source_;
+  }
+  auto finish = [&](bool ok) {
+    if (!ok || post_target == target) return ok;
+    if (!cas_timer_ && std::getenv("KK_DEV_DLSS_LOG")) {
+      cas_timer_ = std::make_unique<AoGpuTimer>(device_, "CAS", "CAS GPU time");
+      cas_timer_->EnableTrace(".cas.csv");
+    }
+    if (cas_timer_) cas_timer_->Begin(cl);
+    const bool result = Blit(cl, post_target, 0, 0, pw, ph, target, 0, 0, 0, 0, channels,
+                             kBlitCas, options_.sharpness);
+    if (cas_timer_) cas_timer_->End(cl);
+    return result;
+  };
+  if (options_.fxaa) {
+    // Spatial AA (swap_post_effect): the back buffer through the ramp into a scratch image,
+    // then FXAA or SMAA 1x into the frame image at its native pixel dimensions.
+    if (!fxaa_source_ || fxaa_source_->getDesc().width != td.width || fxaa_source_->getDesc().height != td.height) {
+      nvrhi::TextureDesc fd;
+      fd.width = td.width;
+      fd.height = td.height;
+      fd.format = td.format;
+      fd.isRenderTarget = true;
+      fd.initialState = nvrhi::ResourceStates::ShaderResource;
+      fd.keepInitialState = true;
+      fd.debugName = "Spatial AA source";
+      if (fxaa_source_) RetireResource(fxaa_source_);
+      fxaa_source_ = device_->createTexture(fd);
+    }
+    if (fxaa_source_ && Blit(cl, source->texture, 0, 0, fw, fh, fxaa_source_, 0, 0, 0, 0, channels,
+                             use_ramp ? kBlitGammaRamp : 0, 0, pw, ph)) {
+      if (options_.fxaa == 3 && smaa_ && smaa_->Render(cl, fxaa_source_, post_target)) return finish(true);
+      return finish(Blit(cl, fxaa_source_, 0, 0, pw, ph, post_target, 0, 0, 0, 0, channels,
+                         kBlitFxaa, options_.fxaa == 2 ? 24u : 12u));
+    }
+  }
+  return finish(Blit(cl, source->texture, 0, 0, fw, fh, post_target, 0, 0, 0, 0, channels,
+                     use_ramp ? kBlitGammaRamp : 0, 0, pw, ph));
+}
+
+}  // namespace nr

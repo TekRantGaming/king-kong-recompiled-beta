@@ -1,0 +1,147 @@
+#include "backend/api_binding.h"
+
+#include "backend/draw_state.h"
+#include "backend/diagnostics.h"
+
+#include <atomic>
+#include <chrono>
+
+namespace nr {
+
+namespace {
+
+DrawTracker* Resolve(void* self) {
+  auto* binding = static_cast<ApiBinding*>(self);
+  return binding && binding->resolve ? binding->resolve(binding->owner) : nullptr;
+}
+
+std::atomic<uint64_t> g_api_us{0}, g_api_calls{0};
+
+// Opt-in call timing; forwarding itself never depends on diagnostics.
+struct ApiTimer {
+  bool enabled = DiagnosticsEnabled();
+  std::chrono::steady_clock::time_point start =
+      enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  ~ApiTimer() {
+    if (!enabled) return;
+    g_api_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - start).count()),
+                       std::memory_order_relaxed);
+    g_api_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+
+#define NR_FORWARD(call)                \
+  ApiTimer api_timer;                   \
+  if (DrawTracker* d = Resolve(self)) { \
+    d->call;                            \
+  }
+
+int IsActive(void* self) { return Resolve(self) ? 1 : 0; }
+void SetRenderTarget(void* self, uint32_t index, uint32_t surface) {
+  NR_FORWARD(SetRenderTarget(index, surface));
+}
+void SetDepthStencilSurface(void* self, uint32_t surface) {
+  NR_FORWARD(SetDepthStencilSurface(surface));
+}
+void SetViewport(void* self, uint32_t viewport) { NR_FORWARD(SetViewport(viewport)); }
+void SetTexture(void* self, uint32_t sampler, uint32_t texture) {
+  NR_FORWARD(SetTexture(sampler, texture));
+}
+void SetIndices(void* self, uint32_t ib) { NR_FORWARD(SetIndices(ib)); }
+void SetStreamSource(void* self, uint32_t stream, uint32_t vb, uint32_t offset, uint32_t stride) {
+  NR_FORWARD(SetStreamSource(stream, vb, offset, stride));
+}
+void SetPixelShader(void* self, uint32_t ps) { NR_FORWARD(SetPixelShader(ps)); }
+void SetVertexShader(void* self, uint32_t vs) { NR_FORWARD(SetVertexShader(vs)); }
+void SetVertexDeclaration(void* self, uint32_t decl) { NR_FORWARD(SetVertexDeclaration(decl)); }
+void SetVsConstantsF(void* self, uint32_t reg, uint32_t data, uint32_t count) {
+  NR_FORWARD(SetVsConstantsF(reg, data, count));
+}
+void SetPsConstantsF(void* self, uint32_t reg, uint32_t data, uint32_t count) {
+  NR_FORWARD(SetPsConstantsF(reg, data, count));
+}
+void SetVsConstantsI(void* self, uint32_t reg, uint32_t data, uint32_t count) {
+  NR_FORWARD(SetVsConstantsI(reg, data, count));
+}
+void SetBlendControl(void* self, uint32_t rt, uint32_t value) {
+  NR_FORWARD(SetBlendControl(rt, value));
+}
+void SetRenderState(void* self, uint32_t state, uint32_t value) {
+  NR_FORWARD(SetRenderState(state, value));
+}
+void SetSamplerState(void* self, uint32_t sampler, uint32_t type, uint32_t value) {
+  NR_FORWARD(SetSamplerState(sampler, type, value));
+}
+void BeginConditionalRendering(void* self, uint32_t id) {
+  NR_FORWARD(BeginConditionalRendering(id));
+}
+void EndConditionalRendering(void* self) { NR_FORWARD(EndConditionalRendering()); }
+void Clear(void* self, uint32_t device, uint32_t rect_count, uint32_t rects, uint32_t flags,
+           uint32_t color, float z, uint32_t stencil) {
+  NR_FORWARD(Clear(device, rect_count, rects, flags, color, z, stencil));
+}
+void ApiResolve(void* self, uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest,
+                uint32_t point, uint32_t level, uint32_t slice, uint32_t clear_color,
+                float clear_z) {
+  NR_FORWARD(Resolve(device, flags, rect, dest, point, level, slice, clear_color, clear_z));
+}
+void DrawIndexed(void* self, uint32_t device, uint32_t prim, int32_t base_vertex,
+                 uint32_t start_index, uint32_t index_count) {
+  NR_FORWARD(DrawIndexed(device, prim, base_vertex, start_index, index_count));
+}
+void Draw(void* self, uint32_t device, uint32_t prim, uint32_t start_vertex,
+          uint32_t vertex_count) {
+  NR_FORWARD(Draw(device, prim, start_vertex, vertex_count));
+}
+void Present(void* self, uint32_t device) { NR_FORWARD(Present(device)); }
+void ShaderCreated(void* self, uint32_t kind, uint32_t container, uint32_t object) {
+  NR_FORWARD(ShaderCreated(kind, container, object));
+}
+void VertexShaderPatched(void* self, uint32_t shader, uint32_t microcode, uint32_t declaration) {
+  NR_FORWARD(VertexShaderPatched(shader, microcode, declaration));
+}
+
+#undef NR_FORWARD
+
+}  // namespace
+
+uint64_t ApiCallMicroseconds() { return g_api_us.load(std::memory_order_relaxed); }
+uint64_t ApiCallCount() { return g_api_calls.load(std::memory_order_relaxed); }
+
+void InitApiBinding(ApiBinding& binding, void* owner, DrawTracker* (*resolve)(void* owner)) {
+  binding.owner = owner;
+  binding.resolve = resolve;
+  NrApi& a = binding.api;
+  a = {};
+  a.version = NR_API_VERSION;
+  a.size = sizeof(NrApi);
+  a.self = &binding;
+  a.is_active = IsActive;
+  a.set_render_target = SetRenderTarget;
+  a.set_depth_stencil_surface = SetDepthStencilSurface;
+  a.set_viewport = SetViewport;
+  a.set_texture = SetTexture;
+  a.set_indices = SetIndices;
+  a.set_stream_source = SetStreamSource;
+  a.set_pixel_shader = SetPixelShader;
+  a.set_vertex_shader = SetVertexShader;
+  a.set_vertex_declaration = SetVertexDeclaration;
+  a.set_vs_constants_f = SetVsConstantsF;
+  a.set_ps_constants_f = SetPsConstantsF;
+  a.set_vs_constants_i = SetVsConstantsI;
+  a.set_blend_control = SetBlendControl;
+  a.set_render_state = SetRenderState;
+  a.set_sampler_state = SetSamplerState;
+  a.begin_conditional_rendering = BeginConditionalRendering;
+  a.end_conditional_rendering = EndConditionalRendering;
+  a.clear = Clear;
+  a.resolve = ApiResolve;
+  a.draw_indexed = DrawIndexed;
+  a.draw = Draw;
+  a.present = Present;
+  a.shader_created = ShaderCreated;
+  a.vertex_shader_patched = VertexShaderPatched;
+}
+
+}  // namespace nr

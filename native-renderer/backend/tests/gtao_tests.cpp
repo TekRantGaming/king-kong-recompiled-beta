@@ -1,0 +1,1336 @@
+// XeGTAO (backend/gtao.*) on a Vulkan device of its own (lavapipe), without the game renderer:
+// a depth image ray-cast on the CPU (a box on a floor in the corner of two walls, sky above
+// them) through a known camera, the occlusion read back and checked for what must hold: the
+// creases are darkened, open floor and the sky are not, half resolution and render scale 2 give
+// the same picture, a picture inside a larger target lands where it should, and the apply
+// passes multiply the colour by it. Every test checks that the Khronos and NVRHI validation
+// layers stayed silent.
+//
+// NR_TEST_IMAGES=<dir> writes the occlusion images there as PPM files.
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "backend/ao_camera.h"
+#include "backend/gtao.h"
+#include "backend/scene_lighting.h"
+#include "backend/tests/check.h"
+#include "backend/tests/vk_test_device.h"
+#include "backend/tests/test_device_proxy.h"
+
+using namespace nr;
+using namespace nr::test;
+
+namespace {
+
+VulkanTestDevice* Device() {
+  static std::unique_ptr<VulkanTestDevice> device = [] {
+    auto d = VulkanTestDevice::Create(true);
+    if (d) {
+      std::printf("  device: %s, Khronos validation %s\n", d->device_name().c_str(),
+                  d->khronos_validation() ? "on" : "not installed");
+    }
+    return d;
+  }();
+  return device.get();
+}
+
+// ------------------------------------------------------------- the scene ---
+
+struct V3 {
+  float x, y, z;
+};
+V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+V3 operator*(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
+float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+V3 Normalize(V3 a) { return a * (1.0f / std::sqrt(Dot(a, a))); }
+
+// The camera: D3D's left-handed look-at and perspective (view z forward, depth 0..1).
+struct Camera {
+  V3 eye{1.5f, 1.6f, -1.5f}, target{-1.0f, 0.3f, 2.6f};
+  float fov_y = 1.0472f, near_plane = 0.1f, far_plane = 100.0f;
+  V3 r, u, f;
+  float px = 0, py = 0, a = 0, b = 0;
+  void Setup(float aspect) {
+    f = Normalize(target - eye);
+    r = Normalize(Cross({0, 1, 0}, f));
+    u = Cross(f, r);
+    py = 1.0f / std::tan(fov_y / 2);
+    px = py / aspect;
+    a = far_plane / (far_plane - near_plane);
+    b = -near_plane * far_plane / (far_plane - near_plane);
+  }
+  // The world-view-projection rows the game's vertex shaders would get (clip = rows . position).
+  void Rows(float m[16]) const {
+    const V3 axes[3] = {r, u, f};
+    float view[12];
+    for (int i = 0; i < 3; ++i) {
+      view[i * 4 + 0] = axes[i].x;
+      view[i * 4 + 1] = axes[i].y;
+      view[i * 4 + 2] = axes[i].z;
+      view[i * 4 + 3] = -Dot(axes[i], eye);
+    }
+    for (int c = 0; c < 4; ++c) {
+      m[0 * 4 + c] = px * view[0 * 4 + c];
+      m[1 * 4 + c] = py * view[1 * 4 + c];
+      m[2 * 4 + c] = a * view[2 * 4 + c] + (c == 3 ? b : 0.0f);
+      m[3 * 4 + c] = view[2 * 4 + c];
+    }
+  }
+};
+
+// Axis-aligned boxes; the floor and walls are thin ones.
+struct Box {
+  V3 lo, hi;
+};
+const Box kScene[] = {
+    {{-2.0f, -0.1f, -6.0f}, {6.0f, 0.0f, 4.0f}},  // floor
+    {{-2.0f, 0.0f, 4.0f}, {6.0f, 3.0f, 4.1f}},    // back wall
+    {{-2.1f, 0.0f, -6.0f}, {-2.0f, 3.0f, 4.0f}},  // left wall
+    {{-1.6f, 0.0f, 2.4f}, {-0.6f, 0.9f, 3.4f}},   // the box
+};
+
+// Distance along the ray to the nearest box (or -1).
+float Hit(V3 o, V3 d) {
+  float best = -1.0f;
+  for (const Box& box : kScene) {
+    float t0 = 0.0f, t1 = 1e30f;
+    const float os[3] = {o.x, o.y, o.z}, ds[3] = {d.x, d.y, d.z};
+    const float lo[3] = {box.lo.x, box.lo.y, box.lo.z}, hi[3] = {box.hi.x, box.hi.y, box.hi.z};
+    bool miss = false;
+    for (int i = 0; i < 3 && !miss; ++i) {
+      if (std::fabs(ds[i]) < 1e-9f) {
+        miss = os[i] < lo[i] || os[i] > hi[i];
+        continue;
+      }
+      float a = (lo[i] - os[i]) / ds[i], b = (hi[i] - os[i]) / ds[i];
+      if (a > b) std::swap(a, b);
+      t0 = std::max(t0, a);
+      t1 = std::min(t1, b);
+      miss = t0 > t1;
+    }
+    if (!miss && t0 > 0.0f && (best < 0.0f || t0 < best)) best = t0;
+  }
+  return best;
+}
+
+// The screen of a picture of gw x gh guest pixels at `scale`, D3D9's half-pixel offset on.
+AoScreen Screen(float gw, float gh, float scale) {
+  AoScreen s;
+  s.x_scale = gw / 2, s.x_offset = gw / 2, s.y_scale = -gh / 2, s.y_offset = gh / 2;
+  s.half_pixel = 0.5f;
+  s.host_scale_x = s.host_scale_y = scale;
+  return s;
+}
+
+// The stored depth of every host pixel of the picture (1 = sky), ray-cast through each pixel's
+// centre as the rasteriser sees it.
+std::vector<float> RayCast(const Camera& cam, const AoScreen& s, uint32_t w, uint32_t h) {
+  std::vector<float> z(size_t(w) * h, 1.0f);
+  for (uint32_t j = 0; j < h; ++j) {
+    for (uint32_t i = 0; i < w; ++i) {
+      const float gx = (float(i) + 0.5f) / s.host_scale_x, gy = (float(j) + 0.5f) / s.host_scale_y;
+      const float nx = (gx - s.x_offset - s.offset_x()) / s.x_scale, ny = (gy - s.y_offset - s.offset_y()) / s.y_scale;
+      const V3 dir = cam.r * (nx / cam.px) + cam.u * (ny / cam.py) + cam.f;  // view z = 1 along it
+      const float t = Hit(cam.eye, dir);
+      if (t > 0.0f) z[size_t(j) * w + i] = cam.a + cam.b / t;  // t is the view z: dir has view z 1
+    }
+  }
+  return z;
+}
+
+// The host pixel a world point lands on.
+void ToPixel(const Camera& cam, const AoScreen& s, V3 p, int& x, int& y) {
+  const V3 v = p - cam.eye;
+  const float vz = Dot(v, cam.f);
+  const float nx = cam.px * Dot(v, cam.r) / vz, ny = cam.py * Dot(v, cam.u) / vz;
+  x = int(std::floor((nx * s.x_scale + s.x_offset + s.offset_x()) * s.host_scale_x));
+  y = int(std::floor((ny * s.y_scale + s.y_offset + s.offset_y()) * s.host_scale_y));
+}
+
+// ------------------------------------------------------------- textures ---
+
+nvrhi::TextureHandle DepthTexture(nvrhi::IDevice* device, const std::vector<float>& z, uint32_t w, uint32_t h,
+                                  uint32_t tw = 0, uint32_t th = 0, uint32_t ox = 0, uint32_t oy = 0) {
+  tw = tw ? tw : w;
+  th = th ? th : h;
+  std::vector<float> texels(size_t(tw) * th, 0.25f);  // outside the picture: something else
+  for (uint32_t j = 0; j < h; ++j)
+    for (uint32_t i = 0; i < w; ++i) texels[size_t(j + oy) * tw + i + ox] = z[size_t(j) * w + i];
+  nvrhi::TextureDesc td;
+  td.width = tw;
+  td.height = th;
+  td.format = nvrhi::Format::R32_FLOAT;
+  td.initialState = nvrhi::ResourceStates::ShaderResource;
+  td.keepInitialState = true;
+  td.debugName = "Test depth";
+  nvrhi::TextureHandle t = device->createTexture(td);
+  nvrhi::CommandListHandle cl = device->createCommandList();
+  cl->open();
+  cl->writeTexture(t, 0, 0, texels.data(), size_t(tw) * 4);
+  cl->close();
+  device->executeCommandList(cl);
+  device->waitForIdle();
+  return t;
+}
+
+struct Image {
+  uint32_t w = 0, h = 0;
+  std::vector<float> v;
+  float at(int x, int y) const { return v[size_t(std::clamp(y, 0, int(h) - 1)) * w + std::clamp(x, 0, int(w) - 1)]; }
+  // The mean over a (2r+1) square: the occlusion is noisy per pixel by design.
+  float around(int x, int y, int r = 1) const {
+    float s = 0;
+    int n = 0;
+    for (int j = -r; j <= r; ++j)
+      for (int i = -r; i <= r; ++i, ++n) s += at(x + i, y + j);
+    return s / float(n);
+  }
+};
+
+// Reads a 2D R32_FLOAT texture back.
+Image ReadR32(nvrhi::IDevice* device, nvrhi::ITexture* texture) {
+  Image out;
+  const nvrhi::TextureDesc& td = texture->getDesc();
+  nvrhi::TextureDesc sd;
+  sd.width = td.width;
+  sd.height = td.height;
+  sd.format = td.format;
+  sd.debugName = "Readback R32";
+  nvrhi::StagingTextureHandle staging = device->createStagingTexture(sd, nvrhi::CpuAccessMode::Read);
+  nvrhi::CommandListHandle cl = device->createCommandList();
+  cl->open();
+  cl->copyTexture(staging, nvrhi::TextureSlice(), texture, nvrhi::TextureSlice());
+  cl->close();
+  device->executeCommandList(cl);
+  device->waitForIdle();
+  size_t pitch = 0;
+  auto* data = static_cast<const uint8_t*>(
+      device->mapStagingTexture(staging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &pitch));
+  if (!data) return out;
+  out.w = td.width;
+  out.h = td.height;
+  out.v.resize(size_t(out.w) * out.h);
+  for (uint32_t y = 0; y < out.h; ++y) std::memcpy(&out.v[size_t(y) * out.w], data + y * pitch, size_t(out.w) * 4);
+  device->unmapStagingTexture(staging);
+  return out;
+}
+
+void Save(const Image& img, const std::string& name) {
+  const char* dir = std::getenv("NR_TEST_IMAGES");
+  if (!dir) return;
+  Pixels p;
+  p.width = img.w;
+  p.height = img.h;
+  p.rgba.resize(img.v.size() * 4);
+  for (size_t i = 0; i < img.v.size(); ++i) p.rgba[i * 4] = p.rgba[i * 4 + 1] = p.rgba[i * 4 + 2] = img.v[i];
+  WritePpm(std::string(dir) + "/gtao_" + name + ".ppm", p);
+}
+
+// The picture: 192 x 108 guest pixels (16:9).
+constexpr uint32_t kGw = 192, kGh = 108;
+
+struct Run {
+  Camera cam;
+  AoScreen screen;
+  uint32_t w = 0, h = 0;
+  std::vector<float> z;  // the stored depth (1: sky)
+  Image ao;
+};
+
+// The occlusion of the scene at a render scale, optionally inside a larger depth texture.
+Run Occlusion(float scale, bool half, int strength = 1, uint32_t ox = 0, uint32_t oy = 0, int mode = 1) {
+  Run run;
+  VulkanTestDevice* gpu = Device();
+  run.cam.Setup(float(kGw) / float(kGh));
+  run.screen = Screen(float(kGw), float(kGh), scale);
+  run.w = uint32_t(std::lround(kGw * scale));
+  run.h = uint32_t(std::lround(kGh * scale));
+  run.z = RayCast(run.cam, run.screen, run.w, run.h);
+  nvrhi::TextureHandle depth = DepthTexture(gpu->device(), run.z, run.w, run.h, run.w + ox + 7, run.h + oy + 5, ox, oy);
+  Gtao gtao(gpu->device());
+  CHECK(gtao.Initialize());
+  float rows[16];
+  run.cam.Rows(rows);
+  GtaoInput in;
+  in.depth = depth;
+  in.x = int32_t(ox);
+  in.y = int32_t(oy);
+  in.width = run.w;
+  in.height = run.h;
+  CHECK(ExtractAoProjection(rows, in.projection));
+  // The viewport of the scene's draws puts the picture at (ox, oy) of the target.
+  in.screen = run.screen;
+  in.screen.x_offset += float(ox) / scale;
+  in.screen.y_offset += float(oy) / scale;
+  GtaoSettings s;
+  s.mode = mode;
+  s.strength = strength;
+  s.half = half;
+  nvrhi::CommandListHandle cl = gpu->device()->createCommandList();
+  cl->open();
+  nvrhi::ITexture* out = gtao.Compute(cl, in, s);
+  cl->close();
+  CHECK(out != nullptr);
+  if (!out) return run;
+  gpu->Execute(cl);
+  gpu->WaitIdle();
+  run.ao = ReadR32(gpu->device(), out);
+  CHECK_EQ(run.ao.w, run.w);
+  CHECK_EQ(run.ao.h, run.h);
+  CHECK_EQ(gtao.stats().computed, uint64_t(1));
+  return run;
+}
+
+// Probe points (world): the floor in the corner by the back wall, the floor beside the box, open
+// floor, the middle of the back wall, and the sky above the walls.
+const V3 kCrease{2.0f, 0.0f, 3.93f}, kBoxFoot{-0.52f, 0.0f, 2.9f}, kOpenFloor{0.8f, 0.0f, 1.2f},
+    kWallMiddle{1.6f, 1.6f, 4.0f};
+
+float Probe(const Run& r, V3 p, int radius = 1) {
+  int x, y;
+  ToPixel(r.cam, r.screen, p, x, y);
+  return r.ao.around(x, y, int(std::lround(radius * r.screen.host_scale_x)));
+}
+
+struct ErrorsChecked {
+  int before = Device() ? Device()->errors() : 0;
+  ~ErrorsChecked() {
+    if (Device()) CHECK_EQ(Device()->errors(), before);  // the validation layers stayed silent
+  }
+};
+
+}  // namespace
+
+TEST(Gtao_CreasesDarkenedOpenSurfacesNot) {
+  if (!Device()) {
+    Fail(__FILE__, __LINE__, "no Vulkan device (install mesa-vulkan-drivers for lavapipe)");
+    return;
+  }
+  ErrorsChecked errors;
+  const Run r = Occlusion(1.0f, false);
+  Save(r.ao, "full_scale1");
+  const float crease = Probe(r, kCrease), foot = Probe(r, kBoxFoot), open = Probe(r, kOpenFloor),
+              wall = Probe(r, kWallMiddle);
+  std::printf("  crease %.3f, box foot %.3f, open floor %.3f, wall %.3f\n", crease, foot, open, wall);
+  CHECK(crease < 0.75f);
+  CHECK(foot < 0.8f);
+  CHECK(open > 0.93f);
+  CHECK(wall > 0.9f);
+  // The sky (above the walls): exactly 1.
+  float sky_min = 1.0f;
+  int sky = 0;
+  for (size_t i = 0; i < r.z.size(); ++i) {
+    if (r.z[i] < 1.0f) continue;
+    ++sky;
+    sky_min = std::min(sky_min, r.ao.v[i]);
+  }
+  CHECK(sky > 50);
+  CHECK_EQ(sky_min, 1.0f);
+  // Never negative, never above 1.
+  for (float v : r.ao.v) {
+    if (v < 0.0f || v > 1.0f) {
+      CHECK(v >= 0.0f && v <= 1.0f);
+      break;
+    }
+  }
+}
+
+TEST(Gtao_StrengthDarkensMore) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  const Run one = Occlusion(1.0f, false, 1), three = Occlusion(1.0f, false, 3);
+  CHECK(Probe(three, kCrease) < Probe(one, kCrease) - 0.03f);
+  CHECK(Probe(three, kOpenFloor) > 0.9f);
+}
+
+TEST(Gtao_HalfResolutionMatchesFull) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  const Run full = Occlusion(1.0f, false), half = Occlusion(1.0f, true);
+  Save(half.ao, "half_scale1");
+  double sum = 0;
+  for (size_t i = 0; i < full.ao.v.size(); ++i) sum += std::fabs(full.ao.v[i] - half.ao.v[i]);
+  const double mae = sum / double(full.ao.v.size());
+  std::printf("  half against full: mean difference %.4f; crease %.3f / %.3f\n", mae, Probe(half, kCrease),
+              Probe(full, kCrease));
+  CHECK(mae < 0.04);
+  CHECK(Probe(half, kCrease) < 0.8f);
+  CHECK(Probe(half, kOpenFloor) > 0.93f);
+}
+
+TEST(Gtao_RenderScaleTwoMatchesOneAfterDownsampling) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  for (bool half : {false, true}) {
+    const Run one = Occlusion(1.0f, half), two = Occlusion(2.0f, half);
+    Save(two.ao, half ? "half_scale2" : "full_scale2");
+    // Scale 2 reduced to the guest's size by an area average, then compared pixel by pixel and at
+    // the probes (the same windows on both).
+    Run down = one;
+    double sum = 0;
+    for (uint32_t y = 0; y < one.h; ++y) {
+      for (uint32_t x = 0; x < one.w; ++x) {
+        const float d = 0.25f * (two.ao.at(2 * x, 2 * y) + two.ao.at(2 * x + 1, 2 * y) + two.ao.at(2 * x, 2 * y + 1) +
+                                 two.ao.at(2 * x + 1, 2 * y + 1));
+        down.ao.v[size_t(y) * one.w + x] = d;
+        sum += std::fabs(d - one.ao.at(int(x), int(y)));
+      }
+    }
+    float worst_probe = 0;
+    for (V3 p : {kCrease, kBoxFoot, kOpenFloor, kWallMiddle}) {
+      std::printf("    probe %.2f %.2f %.2f: %.3f at 1, %.3f at 2\n", p.x, p.y, p.z, Probe(one, p), Probe(down, p));
+      worst_probe = std::max(worst_probe, std::fabs(Probe(down, p) - Probe(one, p)));
+    }
+    const double mae = sum / double(one.w * one.h);
+    std::printf("  %s: scale 2 downsampled against scale 1: mean difference %.4f, worst probe %.3f\n",
+                half ? "half" : "full", mae, worst_probe);
+    CHECK(mae < 0.02);
+    // At half resolution the working image of scale 1 is 96 x 54: the box's thin contact shadow is
+    // softer there than at scale 2 (whose working image is the guest's size). Full resolution has
+    // the same detail at both scales.
+    CHECK(worst_probe < (half ? 0.1f : 0.05f));
+  }
+}
+
+TEST(Gtao_PictureInsideALargerTarget) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  // The picture at (24, 10) of a larger depth texture holding something else around it: the result
+  // is the picture's alone, the same as without the offset.
+  const Run plain = Occlusion(1.0f, false), inside = Occlusion(1.0f, false, 1, 24, 10);
+  float worst = 0;
+  for (size_t i = 0; i < plain.ao.v.size(); ++i) worst = std::max(worst, std::fabs(plain.ao.v[i] - inside.ao.v[i]));
+  CHECK(worst < 1e-5f);
+}
+
+TEST(Gtao_ApplyPasses) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  VulkanTestDevice* gpu = Device();
+  nvrhi::IDevice* device = gpu->device();
+  Camera cam;
+  cam.Setup(float(kGw) / float(kGh));
+  const AoScreen screen = Screen(float(kGw), float(kGh), 1.0f);
+  const std::vector<float> z = RayCast(cam, screen, kGw, kGh);
+  nvrhi::TextureHandle depth = DepthTexture(device, z, kGw, kGh);
+  // A colour target a little larger than the picture, grey with alpha 0.5.
+  nvrhi::TextureDesc cd;
+  cd.width = kGw + 8;
+  cd.height = kGh + 4;
+  cd.format = nvrhi::Format::RGBA8_UNORM;
+  cd.isRenderTarget = true;
+  cd.initialState = nvrhi::ResourceStates::RenderTarget;
+  cd.keepInitialState = true;
+  cd.debugName = "Test colour";
+  nvrhi::TextureHandle color = device->createTexture(cd);
+  Gtao gtao(device);
+  CHECK(gtao.Initialize());
+  float rows[16];
+  cam.Rows(rows);
+  GtaoInput in;
+  in.depth = depth;
+  in.width = kGw;
+  in.height = kGh;
+  CHECK(ExtractAoProjection(rows, in.projection));
+  in.screen = screen;
+  GtaoSettings s;
+  nvrhi::CommandListHandle cl = device->createCommandList();
+  for (int mode : {1, 2}) {
+    cl->open();
+    cl->clearTextureFloat(color, nvrhi::AllSubresources, nvrhi::Color(0.8f, 0.6f, 0.4f, 0.5f));
+    CHECK(gtao.Compute(cl, in, s) != nullptr);
+    CHECK(gtao.ApplyToTarget(cl, color, mode));
+    cl->close();
+    gpu->Execute(cl);
+    gpu->WaitIdle();
+    const Image ao = ReadR32(device, gtao.occlusion());
+    const Pixels px = gpu->ReadBack(color);
+    float worst = 0;
+    for (uint32_t y = 0; y < kGh; ++y) {
+      for (uint32_t x = 0; x < kGw; ++x) {
+        const float a = ao.at(int(x), int(y));
+        const float* p = px.at(x, y);
+        const float want[3] = {mode == 1 ? 0.8f * a : a, mode == 1 ? 0.6f * a : a, mode == 1 ? 0.4f * a : a};
+        for (int c = 0; c < 3; ++c) worst = std::max(worst, std::fabs(p[c] - want[c]));
+        worst = std::max(worst, std::fabs(p[3] - 0.5f) > 1.0f / 255 ? 1.0f : 0.0f);  // alpha untouched
+      }
+    }
+    // Outside the picture: untouched.
+    const float* outside = px.at(kGw + 3, kGh + 1);
+    CHECK(std::fabs(outside[0] - 0.8f) < 1.5f / 255);
+    std::printf("  mode %d: worst difference %.4f\n", mode, worst);
+    CHECK(worst <= 1.5f / 255);
+  }
+  // The copy for the resolve moment, without fog: colour times the occlusion, outside untouched.
+  cl->open();
+  cl->clearTextureFloat(color, nvrhi::AllSubresources, nvrhi::Color(0.8f, 0.6f, 0.4f, 0.5f));
+  CHECK(gtao.Compute(cl, in, s) != nullptr);
+  nvrhi::ITexture* copy = gtao.ApplyToCopy(cl, color, depth, AoFog{}, 1);
+  CHECK(copy != nullptr);
+  cl->close();
+  gpu->Execute(cl);
+  gpu->WaitIdle();
+  if (copy) {
+    const Image ao = ReadR32(device, gtao.occlusion());
+    const Pixels px = gpu->ReadBack(copy);
+    float worst = 0;
+    for (uint32_t y = 0; y < kGh; ++y)
+      for (uint32_t x = 0; x < kGw; ++x) worst = std::max(worst, std::fabs(px.at(x, y)[0] - 0.8f * ao.at(int(x), int(y))));
+    CHECK(worst <= 1.5f / 255);
+    CHECK(std::fabs(px.at(kGw + 3, kGh + 1)[0] - 0.8f) < 1.5f / 255);
+    CHECK_EQ(gtao.stats().copies, uint64_t(1));
+  }
+}
+
+TEST(Gtao_DepthTargetsAndTheirCopy) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  // The game renderer's depth targets are D32S8: read directly and copied (the resolve moment keeps
+  // a copy). A plane facing the camera (stored depth 0.995: 20 m away) has no occlusion.
+  VulkanTestDevice* gpu = Device();
+  nvrhi::IDevice* device = gpu->device();
+  nvrhi::TextureDesc dd;
+  dd.width = 96;
+  dd.height = 64;
+  dd.format = nvrhi::Format::D32S8;
+  dd.isRenderTarget = true;
+  dd.initialState = nvrhi::ResourceStates::DepthWrite;
+  dd.keepInitialState = true;
+  dd.debugName = "Test D32S8";
+  nvrhi::TextureHandle depth = device->createTexture(dd);
+  Gtao gtao(device);
+  CHECK(gtao.Initialize());
+  Camera cam;
+  cam.Setup(96.0f / 64.0f);
+  float rows[16];
+  cam.Rows(rows);
+  GtaoInput in;
+  in.depth = depth;
+  in.width = 96;
+  in.height = 64;
+  CHECK(ExtractAoProjection(rows, in.projection));
+  in.screen = Screen(96, 64, 1.0f);
+  nvrhi::CommandListHandle cl = device->createCommandList();
+  cl->open();
+  cl->clearDepthStencilTexture(depth, nvrhi::AllSubresources, true, 0.995f, true, 0);
+  nvrhi::ITexture* copy = gtao.CopyDepth(cl, depth);
+  CHECK(copy != nullptr);
+  nvrhi::ITexture* out = gtao.Compute(cl, in, GtaoSettings{});
+  CHECK(out != nullptr);
+  cl->close();
+  gpu->Execute(cl);
+  gpu->WaitIdle();
+  if (copy) {
+    const Image c = ReadR32(device, copy);
+    CHECK_EQ(c.w, 96u);
+    CHECK(std::fabs(c.at(5, 5) - 0.995f) < 1e-6f && std::fabs(c.at(95, 63) - 0.995f) < 1e-6f);
+  }
+  if (out) {
+    const Image ao = ReadR32(device, out);
+    Save(ao, "flat");
+    float lowest = 1.0f;
+    int lx = 0, ly = 0;
+    for (uint32_t i = 0; i < ao.v.size(); ++i) {
+      if (ao.v[i] < lowest) {
+        lowest = ao.v[i];
+        lx = int(i % ao.w);
+        ly = int(i / ao.w);
+      }
+    }
+    std::printf("  flat plane: lowest at %d, %d\n", lx, ly);
+    // Away from the picture's border (where XeGTAO's samples off the picture repeat the edge):
+    // no occlusion to speak of.
+    float inner = 1.0f;
+    for (uint32_t y = 16; y + 16 < ao.h; ++y)
+      for (uint32_t x = 16; x + 16 < ao.w; ++x) inner = std::min(inner, ao.at(int(x), int(y)));
+    std::printf("  flat plane: lowest inside %.3f\n", inner);
+    CHECK(inner > 0.98f);
+    std::printf("  flat plane: lowest %.3f\n", lowest);
+    CHECK(lowest > 0.9f);
+  }
+  CHECK_EQ(gtao.stats().depth_copies, uint64_t(1));
+}
+
+TEST(Gtao_TemporalReducesNoiseRejectsDepthAndResets) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  auto* gpu = Device();
+  Camera cam;
+  cam.Setup(float(kGw) / kGh);
+  GtaoInput in;
+  in.width = kGw; in.height = kGh;
+  in.screen = Screen(kGw, kGh, 1);
+  float rows[16]; cam.Rows(rows);
+  CHECK(ExtractAoProjection(rows, in.projection));
+  auto z = RayCast(cam, in.screen, kGw, kGh);
+  auto depth = DepthTexture(gpu->device(), z, kGw, kGh);
+  in.depth = depth;
+  in.reprojection_valid = true;
+  Gtao temporal(gpu->device()), spatial(gpu->device());
+  CHECK(temporal.Initialize() && spatial.Initialize());
+  GtaoSettings local, raw;
+  local.temporal = true;
+  raw.temporal_upscaler = true;  // same rotating noise, without a history here
+  auto compute = [&](Gtao& gtao, const GtaoSettings& settings) {
+    auto cl = gpu->device()->createCommandList();
+    cl->open();
+    auto* result = gtao.Compute(cl, in, settings);
+    CHECK(result != nullptr);
+    cl->close(); gpu->Execute(cl); gpu->WaitIdle();
+    return ReadR32(gpu->device(), result);
+  };
+  auto delta = [&](const Image& a, const Image& b) {
+    double sum = 0;
+    for (size_t i = 0; i < a.v.size(); ++i) if (z[i] < 1) sum += std::fabs(a.v[i] - b.v[i]);
+    return sum / a.v.size();
+  };
+  double noisy = 0, smooth = 0;
+  Image previous_local, previous_raw;
+  for (uint64_t f = 1; f <= 24; ++f) {
+    in.frame = f;
+    Image a = compute(temporal, local), b = compute(spatial, raw);
+    if (f > 8) { smooth += delta(a, previous_local); noisy += delta(b, previous_raw); }
+    previous_local = a; previous_raw = b;
+  }
+  std::printf("  rotating spatial MAE %.6f, temporal MAE %.6f\n", noisy / 16, smooth / 16);
+  CHECK(smooth < noisy * 0.6);
+  CHECK_EQ(temporal.stats().history_frames, uint64_t(23));
+  // Skipped frames and a live sample change must start fresh, rather than mix old AO.
+  in.frame = 30;
+  Image a = compute(temporal, local), b = compute(spatial, raw);
+  CHECK(delta(a,b) < 1e-6);
+  for (int quality : {1,3,2}) {
+    ++in.frame;
+    local.sample_quality = raw.sample_quality = quality;
+    a = compute(temporal, local); b = compute(spatial, raw);
+    CHECK(delta(a,b) < 1e-6);
+    for (size_t i = 0; i < a.v.size(); ++i) {
+      CHECK(std::isfinite(a.v[i]) && a.v[i] >= 0 && a.v[i] <= 1);
+      if (z[i] == 1) CHECK(a.v[i] == 1);
+    }
+  }
+  // Delegating denoise to an SDK must return the spatial result and discard local
+  // history. Switching back starts fresh even with a contiguous frame number.
+  ++in.frame;
+  a = compute(temporal, raw); b = compute(spatial, raw);
+  CHECK(delta(a,b) < 1e-6);
+  const uint64_t history_frames = temporal.stats().history_frames;
+  ++in.frame;
+  a = compute(temporal, local); b = compute(spatial, raw);
+  CHECK(delta(a,b) < 1e-6);
+  CHECK_EQ(temporal.stats().history_frames, history_frames);
+  // A viewport offset change invalidates the previous picture's mapping.
+  ++in.frame;
+  in.screen.window_x += 1;
+  a = compute(temporal, local); b = compute(spatial, raw);
+  CHECK(delta(a,b) < 1e-6);
+  CHECK_EQ(temporal.stats().history_frames, history_frames);
+  // An unmatched camera uses fixed spatial noise rather than rotating samples
+  // without a usable reprojection.
+  ++in.frame;
+  in.reprojection_valid = false;
+  GtaoSettings fixed;
+  a = compute(temporal, local); b = compute(spatial, fixed);
+  CHECK(delta(a,b) < 1e-6);
+  CHECK_EQ(temporal.stats().history_frames, history_frames);
+  in.reprojection_valid = true;
+  // A new surface far in front of the previous scene rejects the old depth.
+  z.assign(z.size(), 0.5f);
+  depth = DepthTexture(gpu->device(), z, kGw, kGh);
+  in.depth = depth; ++in.frame;
+  a = compute(temporal, local); b = compute(spatial, raw);
+  CHECK(delta(a,b) < 1e-6);
+  // An off-screen reprojection is also wholly rejected.
+  in.reprojection[3] = 4;
+  ++in.frame;
+  a = compute(temporal, local); b = compute(spatial, raw);
+  CHECK(delta(a,b) < 1e-6);
+  Save(previous_raw, "temporal_before");
+  Save(previous_local, "temporal_after");
+}
+
+TEST(Gtao_RefusesWhatItCannotUse) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  nvrhi::IDevice* device = Device()->device();
+  Gtao gtao(device);
+  CHECK(gtao.Initialize());
+  std::vector<float> z(16 * 16, 0.5f);
+  nvrhi::TextureHandle depth = DepthTexture(device, z, 16, 16);
+  nvrhi::CommandListHandle cl = device->createCommandList();
+  cl->open();
+  GtaoInput in;
+  CHECK(gtao.Compute(cl, in, GtaoSettings{}) == nullptr);  // no depth
+  in.depth = depth;
+  in.width = in.height = 16;
+  CHECK(gtao.Compute(cl, in, GtaoSettings{}) == nullptr);  // no camera
+  Camera cam;
+  cam.Setup(1.0f);
+  float rows[16];
+  cam.Rows(rows);
+  CHECK(ExtractAoProjection(rows, in.projection));
+  in.width = 17;  // larger than the texture
+  CHECK(gtao.Compute(cl, in, GtaoSettings{}) == nullptr);
+  CHECK(!gtao.ApplyToTarget(cl, nullptr, 1));
+  cl->close();
+  Device()->Execute(cl);
+  Device()->WaitIdle();
+}
+
+// ------------------------------------------------------ normal smoothing ---
+// A low-poly scene: a 12-sided prism (30 degrees between neighbouring sides, a faceted character's
+// creases) standing on the floor in front of the back wall, and the box (right angles). Each solid is
+// convex: planes with outward normals, inside where n.p <= d.
+
+namespace {
+
+struct Plane {
+  V3 n;
+  float d;
+};
+struct Solid {
+  std::vector<Plane> planes;
+  int id;
+};
+
+Solid BoxSolid(const Box& b, int id) {
+  return {{{{1, 0, 0}, b.hi.x}, {{-1, 0, 0}, -b.lo.x}, {{0, 1, 0}, b.hi.y}, {{0, -1, 0}, -b.lo.y},
+           {{0, 0, 1}, b.hi.z}, {{0, 0, -1}, -b.lo.z}},
+          id};
+}
+
+constexpr int kPrismSides = 12;
+const V3 kPrismCentre{0.9f, 0.0f, 2.0f};
+constexpr float kPrismRadius = 0.6f, kPrismHeight = 1.3f;
+
+Solid PrismSolid(int id) {
+  Solid s{{{{0, 1, 0}, kPrismHeight}, {{0, -1, 0}, 0.0f}}, id};
+  for (int k = 0; k < kPrismSides; ++k) {
+    const float a = 6.2831853f * (float(k) + 0.5f) / float(kPrismSides);
+    const V3 n{std::cos(a), 0.0f, std::sin(a)};
+    s.planes.push_back({n, Dot(n, kPrismCentre) + kPrismRadius * std::cos(3.14159265f / kPrismSides)});
+  }
+  return s;
+}
+
+enum SmoothId { kSkyId = -1, kFloorId = 0, kWallId = 1, kBoxId = 2, kPrismId = 3, kPanelId = 4 };
+
+// A flat panel in front of the back wall, turned 25 degrees: its normal is close to the wall's, so only
+// the plane test keeps the two apart at its silhouette.
+Solid PanelSolid(int id) {
+  const float a = 25.0f * 3.14159265f / 180.0f;
+  const V3 c{-0.4f, 1.9f, 3.5f}, n{-std::sin(a), 0.0f, -std::cos(a)}, t{std::cos(a), 0.0f, -std::sin(a)};
+  return {{{n, Dot(n, c) + 0.05f}, {n * -1.0f, -Dot(n, c) + 0.05f}, {t, Dot(t, c) + 0.5f}, {t * -1.0f, -Dot(t, c) + 0.5f},
+           {{0, 1, 0}, c.y + 0.4f}, {{0, -1, 0}, -c.y + 0.4f}},
+          id};
+}
+
+std::vector<Solid> SmoothScene() {
+  return {BoxSolid(kScene[0], kFloorId), BoxSolid(kScene[1], kWallId), BoxSolid(kScene[3], kBoxId),
+          PrismSolid(kPrismId), PanelSolid(kPanelId)};
+}
+
+// Nearest hit: distance (or -1), which solid and which of its planes (the face).
+float HitSolids(const std::vector<Solid>& solids, V3 o, V3 d, int& id, int& face) {
+  float best = -1.0f;
+  id = kSkyId;
+  face = -1;
+  for (const Solid& s : solids) {
+    float t0 = 0.0f, t1 = 1e30f;
+    int entered = -1;
+    bool miss = false;
+    for (size_t i = 0; i < s.planes.size() && !miss; ++i) {
+      const float denom = Dot(s.planes[i].n, d), num = s.planes[i].d - Dot(s.planes[i].n, o);
+      if (std::fabs(denom) < 1e-12f) {
+        miss = num < 0.0f;
+        continue;
+      }
+      const float t = num / denom;
+      if (denom < 0.0f) {
+        if (t > t0) {
+          t0 = t;
+          entered = int(i);
+        }
+      } else {
+        t1 = std::min(t1, t);
+      }
+      miss = t0 > t1;
+    }
+    if (!miss && t0 > 0.0f && entered >= 0 && (best < 0.0f || t0 < best)) {
+      best = t0;
+      id = s.id;
+      face = entered;
+    }
+  }
+  return best;
+}
+
+struct SmoothRunResult {
+  uint32_t w = 0, h = 0;
+  std::vector<int> id, face;
+  std::vector<V3> normal;  // the view-space normals after Compute (decoded)
+  Image ao;
+};
+
+V3 DecodeNormal(uint32_t p) {
+  const V3 u{float(p & 0x7ff) / 2047.0f, float((p >> 11) & 0x7ff) / 2047.0f, float((p >> 22) & 0x3ff) / 1023.0f};
+  return Normalize(u * 2.0f - V3{1, 1, 1});
+}
+
+SmoothRunResult SmoothRun(int level, float scale = 2.0f, bool half = false) {
+  SmoothRunResult r;
+  VulkanTestDevice* gpu = Device();
+  Camera cam;
+  cam.Setup(float(kGw) / float(kGh));
+  const AoScreen screen = Screen(float(kGw), float(kGh), scale);
+  r.w = uint32_t(std::lround(kGw * scale));
+  r.h = uint32_t(std::lround(kGh * scale));
+  const std::vector<Solid> solids = SmoothScene();
+  std::vector<float> z(size_t(r.w) * r.h, 1.0f);
+  r.id.assign(z.size(), kSkyId);
+  r.face.assign(z.size(), -1);
+  for (uint32_t j = 0; j < r.h; ++j) {
+    for (uint32_t i = 0; i < r.w; ++i) {
+      const float gx = (float(i) + 0.5f) / screen.host_scale_x, gy = (float(j) + 0.5f) / screen.host_scale_y;
+      const float nx = (gx - screen.x_offset - screen.offset_x()) / screen.x_scale,
+                  ny = (gy - screen.y_offset - screen.offset_y()) / screen.y_scale;
+      const V3 dir = cam.r * (nx / cam.px) + cam.u * (ny / cam.py) + cam.f;
+      const size_t k = size_t(j) * r.w + i;
+      const float t = HitSolids(solids, cam.eye, dir, r.id[k], r.face[k]);
+      if (t > 0.0f) z[k] = cam.a + cam.b / t;
+    }
+  }
+  nvrhi::TextureHandle depth = DepthTexture(gpu->device(), z, r.w, r.h);
+  Gtao gtao(gpu->device());
+  CHECK(gtao.Initialize());
+  float rows[16];
+  cam.Rows(rows);
+  GtaoInput in;
+  in.depth = depth;
+  in.width = r.w;
+  in.height = r.h;
+  in.screen = screen;
+  CHECK(ExtractAoProjection(rows, in.projection));
+  GtaoSettings s;
+  s.half = half;
+  s.normal_smoothing = level;
+  nvrhi::CommandListHandle cl = gpu->device()->createCommandList();
+  cl->open();
+  nvrhi::ITexture* out = gtao.Compute(cl, in, s);
+  cl->close();
+  CHECK(out != nullptr);
+  if (!out) return r;
+  gpu->Execute(cl);
+  gpu->WaitIdle();
+  r.ao = ReadR32(gpu->device(), out);
+  // The normals (padded working image, R32_UINT): the raw bits through the R32 readback.
+  const Image packed = ReadR32(gpu->device(), gtao.normals());
+  const uint32_t step = half ? 2 : 1;
+  r.normal.resize(z.size());
+  for (uint32_t j = 0; j < r.h; ++j) {
+    for (uint32_t i = 0; i < r.w; ++i) {
+      uint32_t bits;
+      std::memcpy(&bits, &packed.v[size_t(j / step) * packed.w + i / step], 4);
+      r.normal[size_t(j) * r.w + i] = DecodeNormal(bits);
+    }
+  }
+  return r;
+}
+
+float AngleDegrees(V3 a, V3 b) {
+  return std::acos(std::clamp(Dot(a, b), -1.0f, 1.0f)) * 57.29578f;
+}
+
+struct SmoothStats {
+  float prism_step = 0;     // mean of the largest neighbour-to-neighbour turn around each crease of the prism
+  float box_turn = 0;       // mean total turn across the box's edges (right angles: kept near 90 degrees)
+  float prism_up = 0;       // largest |n . up| inside the prism's sides (0: vertical)
+  float floor_up = 1;       // smallest n . up inside the floor (1: flat)
+  float flat_change = 0;    // largest change against `ref` on the wall and the panel near their silhouette
+  int crease_pairs = 0, box_pairs = 0, flat_pixels = 0, flat_x = 0, flat_y = 0, flat_id = 0;
+};
+
+// Pairs are taken `step` pixels apart (2 at half resolution, where two host pixels share a working pixel).
+SmoothStats Measure(const SmoothRunResult& r, V3 up, const SmoothRunResult& ref, int step) {
+  SmoothStats s;
+  double steps = 0, turns = 0;
+  const int m = 4 * step;
+  auto n = [&](int x, int y) { return r.normal[size_t(y) * r.w + size_t(x)]; };
+  auto id = [&](int x, int y) { return r.id[size_t(y) * r.w + size_t(x)]; };
+  auto face = [&](int x, int y) { return r.face[size_t(y) * r.w + size_t(x)]; };
+  for (int y = m; y + m < int(r.h); ++y) {
+    for (int x = m; x + m < int(r.w); ++x) {
+      const int o = id(x, y);
+      // A crease between x and x + step, with the same solid 3 steps either side (not a silhouette).
+      bool same = true;
+      for (int d = -3; d <= 4; ++d) same &= id(x + d * step, y) == o;
+      if (same && face(x, y) != face(x + step, y) && (x % step) == 0) {
+        if (o == kPrismId && face(x - 3 * step, y) >= 2 && face(x + 4 * step, y) >= 2) {
+          float largest = 0;
+          for (int d = -3; d <= 3; ++d) largest = std::max(largest, AngleDegrees(n(x + d * step, y), n(x + (d + 1) * step, y)));
+          steps += largest;
+          ++s.crease_pairs;
+        } else if (o == kBoxId) {
+          turns += AngleDegrees(n(x - 3 * step, y), n(x + 4 * step, y));
+          ++s.box_pairs;
+        }
+      }
+      // The wall and the panel in front of it: pixels whose own face covers their (2 step) neighbourhood
+      // (the rebuilt normal is exact there) and with nothing but wall and panel within 10 pixels, so
+      // the silhouette between the two is in reach of every tap but the floor's and prism's creases
+      // (whose rebuilt crease pixels blend both sides) are not.
+      if ((o == kWallId || o == kPanelId) && x >= 10 && y >= 10 && x + 10 < int(r.w) && y + 10 < int(r.h)) {
+        bool flat = true;
+        for (int dy = -10; dy <= 10 && flat; ++dy)
+          for (int dx = -10; dx <= 10; ++dx) {
+            const int q = id(x + dx, y + dy);
+            flat &= q == kWallId || q == kPanelId;
+            if (std::abs(dx) <= 2 * step && std::abs(dy) <= 2 * step) flat &= q == o && face(x + dx, y + dy) == face(x, y);
+          }
+        if (flat) {
+          const float change = AngleDegrees(n(x, y), ref.normal[size_t(y) * r.w + size_t(x)]);
+          if (change > s.flat_change) { s.flat_change = change; s.flat_x = x; s.flat_y = y; s.flat_id = o; }
+          ++s.flat_pixels;
+        }
+      }
+      // Pixels with their whole (4 step) neighbourhood on their own solid; the prism's sides only.
+      bool inside = true;
+      for (int dy = -m; dy <= m && inside; ++dy)
+        for (int dx = -m; dx <= m; ++dx) inside &= id(x + dx, y + dy) == o && !(o == kPrismId && face(x + dx, y + dy) < 2);
+      if (!inside) continue;
+      if (o == kPrismId) s.prism_up = std::max(s.prism_up, std::fabs(Dot(n(x, y), up)));
+      if (o == kFloorId) s.floor_up = std::min(s.floor_up, Dot(n(x, y), up));
+    }
+  }
+  s.prism_step = s.crease_pairs ? float(steps / s.crease_pairs) : 0.0f;
+  s.box_turn = s.box_pairs ? float(turns / s.box_pairs) : 0.0f;
+  return s;
+}
+
+// The floor's view-space normal (up) from the unsmoothed run: the mean over open floor.
+V3 FloorUp(const SmoothRunResult& r) {
+  V3 sum{0, 0, 0};
+  for (size_t k = 0; k < r.normal.size(); ++k)
+    if (r.id[k] == kFloorId) sum = sum + r.normal[k];
+  return Normalize(sum);
+}
+
+}  // namespace
+
+TEST(Gtao_NormalSmoothingSoftensFacetsKeepsEdges) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  for (bool half : {false, true}) {
+    // 960 x 540: the smoothing radius (16 host pixels of a 1080-line picture at High) is 8 pixels here.
+    const SmoothRunResult off = SmoothRun(0, 5.0f, half), low = SmoothRun(1, 5.0f, half), high = SmoothRun(2, 5.0f, half);
+    const V3 up = FloorUp(off);
+    const int step = half ? 2 : 1;
+    const SmoothStats o = Measure(off, up, off, step), l = Measure(low, up, off, step), h = Measure(high, up, off, step);
+    for (const auto& [name, st] : {std::pair{"off", o}, std::pair{"low", l}, std::pair{"high", h}}) {
+      std::printf("  %s %s: prism largest step %.1f deg (%d creases), box turn %.1f deg (%d), prism |n.up| %.3f, "
+                  "floor n.up min %.3f, wall/panel change %.2f deg (%d px; largest at %d,%d on %d)\n",
+                  half ? "half" : "full", name, st.prism_step, st.crease_pairs, st.box_turn, st.box_pairs, st.prism_up,
+                  st.floor_up, st.flat_change, st.flat_pixels, st.flat_x, st.flat_y, st.flat_id);
+    }
+    CHECK(o.crease_pairs > 20);
+    CHECK(o.box_pairs > 5);
+    CHECK(o.flat_pixels > 500);
+    // Off: the facets are flat, a 30 degree turn within a pixel or two.
+    CHECK(o.prism_step > 12.0f);
+    CHECK(o.box_turn > 80.0f);
+    // Smoothing spreads the crease over several pixels: much smaller steps between neighbours.
+    CHECK(l.prism_step < o.prism_step * 0.8f);
+    CHECK(h.prism_step < o.prism_step * 0.6f);
+    for (const SmoothStats& st : {l, h}) {
+      // Right angles are kept.
+      CHECK(st.box_turn > o.box_turn - 5.0f);
+      CHECK(st.floor_up > o.floor_up - 0.01f);
+      // The prism's sides stay vertical: nothing of the floor leaks in.
+      CHECK(st.prism_up < o.prism_up + 0.03f);
+      // The panel (25 degrees from the wall behind it) and the wall keep their own normals: the plane
+      // test separates them at the silhouette (blending the two would turn them by up to 25 degrees; what
+      // remains, about 2.5, comes from the panel's thin side, whose rebuilt pixels mix front and side).
+      CHECK(st.flat_change < 4.0f);
+    }
+    // The occlusion stays valid.
+    for (float v : high.ao.v) {
+      if (v < 0.0f || v > 1.0f) {
+        CHECK(v >= 0.0f && v <= 1.0f);
+        break;
+      }
+    }
+  }
+}
+
+TEST(Gtao_NormalSmoothingKeepsCreaseOcclusion) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  // The corner of floor and walls is a right angle, so the occlusion there does not change.
+  for (int level : {1, 2}) {
+    Run r;
+    {
+      VulkanTestDevice* gpu = Device();
+      r.cam.Setup(float(kGw) / float(kGh));
+      r.screen = Screen(float(kGw), float(kGh), 1.0f);
+      r.w = kGw;
+      r.h = kGh;
+      r.z = RayCast(r.cam, r.screen, r.w, r.h);
+      nvrhi::TextureHandle depth = DepthTexture(gpu->device(), r.z, r.w, r.h);
+      Gtao gtao(gpu->device());
+      CHECK(gtao.Initialize());
+      float rows[16];
+      r.cam.Rows(rows);
+      GtaoInput in;
+      in.depth = depth;
+      in.width = r.w;
+      in.height = r.h;
+      in.screen = r.screen;
+      CHECK(ExtractAoProjection(rows, in.projection));
+      GtaoSettings s;
+      s.normal_smoothing = level;
+      nvrhi::CommandListHandle cl = gpu->device()->createCommandList();
+      cl->open();
+      nvrhi::ITexture* out = gtao.Compute(cl, in, s);
+      cl->close();
+      CHECK(out != nullptr);
+      if (!out) continue;
+      gpu->Execute(cl);
+      gpu->WaitIdle();
+      r.ao = ReadR32(gpu->device(), out);
+    }
+    const Run plain = Occlusion(1.0f, false);
+    double sum = 0;
+    for (size_t i = 0; i < plain.ao.v.size(); ++i) sum += std::fabs(plain.ao.v[i] - r.ao.v[i]);
+    const double mae = sum / double(plain.ao.v.size());
+    std::printf("  smoothing %d: crease %.3f (off %.3f), open floor %.3f, mean difference to off %.4f\n", level,
+                Probe(r, kCrease), Probe(plain, kCrease), Probe(r, kOpenFloor), mae);
+    CHECK(Probe(r, kOpenFloor) > 0.93f);
+    CHECK(std::fabs(Probe(r, kCrease) - Probe(plain, kCrease)) < 0.02f);
+    CHECK(mae < 0.01);
+  }
+}
+
+TEST(Gtao_SmoothingLevels) {
+  CHECK_EQ(Gtao::SmoothingFor(0).max_pixels_1080, 0.0f);
+  CHECK(Gtao::SmoothingFor(1).max_pixels_1080 > 0.0f);
+  CHECK(Gtao::SmoothingFor(2).max_pixels_1080 > Gtao::SmoothingFor(1).max_pixels_1080);
+  CHECK(Gtao::SmoothingFor(2).max_angle_degrees <= 60.0f);  // right angles are never smoothed
+  CHECK(Gtao::SmoothingFor(1).full_angle_degrees < Gtao::SmoothingFor(1).max_angle_degrees);
+  CHECK_EQ(Gtao::SmoothingFor(3).max_pixels_1080, 0.0f);
+}
+
+TEST(Lighting_TimersGroupContiguousDraws) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  LightingConfig config;
+  config.gpu_time = true;
+  SceneLighting lighting(Device()->device(), config);
+  CHECK(lighting.Initialize());
+  auto cl = Device()->device()->createCommandList();
+  for (uint64_t frame = 0; frame < 4; ++frame) {
+    cl->open();
+    SceneLighting::Draw draw;
+    draw.frame = frame;
+    // A per-draw query exhausts the Vulkan device's pool before this frame submits.
+    // The game can split a water surface into many consecutive draws, as in The Cave.
+    for (LightFamily family : {LightFamily::kShadowQuad, LightFamily::kWater}) {
+      draw.family = family;
+      for (int i = 0; i < 1024; ++i) {
+        lighting.BeforeDraw(cl, frame, family);
+        lighting.OnDraw(cl, draw);
+      }
+    }
+    lighting.EndTimedDraws(cl);  // before Present's other scene effects
+    lighting.OnPresent(cl);
+    cl->close();
+    Device()->Execute(cl);
+    Device()->WaitIdle();
+  }
+}
+
+namespace {
+
+class FailingBindings final : public nvrhi::TestDeviceProxy {
+ public:
+  using TestDeviceProxy::TestDeviceProxy;
+  unsigned calls = 0, fail_at = 0;
+  nvrhi::BindingSetHandle createBindingSet(const nvrhi::BindingSetDesc& desc,
+                                          nvrhi::IBindingLayout* layout) override {
+    if (++calls == fail_at) return nullptr;
+    return device_->createBindingSet(desc, layout);
+  }
+};
+
+// A scene with a camera and populated depth, followed by a hooked water draw.
+struct LightingScene {
+  nvrhi::TextureHandle depth, color;
+  std::vector<uint8_t> constants = std::vector<uint8_t>(4096);
+  SceneLighting::Draw draw;
+  explicit LightingScene(nvrhi::IDevice* device) {
+    depth = DepthTexture(device, std::vector<float>(64 * 64, 0.995f), 64, 64);
+    nvrhi::TextureDesc td;
+    td.width = td.height = 64;
+    td.format = nvrhi::Format::RGBA16_FLOAT;
+    td.isRenderTarget = true;
+    td.initialState = nvrhi::ResourceStates::RenderTarget;
+    td.keepInitialState = true;
+    color = device->createTexture(td);
+    Camera camera;
+    camera.Setup(1);
+    float rows[16];
+    camera.Rows(rows);
+    for (unsigned i = 0; i < 16; ++i) {
+      uint32_t bits;
+      std::memcpy(&bits, rows + i, 4);
+      for (unsigned j = 0; j < 4; ++j) constants[i * 4 + j] = uint8_t(bits >> (24 - j * 8));
+    }
+    draw.color = {1, color};
+    draw.depth = {2, depth};
+    draw.frame_size = true;
+    draw.vs_constants = constants.data();
+    draw.screen = Screen(64, 64, 1);
+    draw.state.color = draw.state.depth = draw.state.depth_test = draw.state.depth_write = true;
+    draw.state.blend_control = 0x00010001;  // ONE/ZERO, unblended
+    draw.state.primitive = 4;
+  }
+  void Opaque(SceneLighting& lighting, nvrhi::ICommandList* cl, uint64_t frame) {
+    draw.frame = frame;
+    draw.family = LightFamily::kNone;
+    draw.state.ps_hash = 0;
+    lighting.OnDraw(cl, draw);
+  }
+  void Water(SceneLighting& lighting, nvrhi::ICommandList* cl) {
+    draw.family = LightFamily::kWater;
+    draw.state.ps_hash = 0xF22A76FB8F40F38Bull;
+    lighting.OnDraw(cl, draw);
+  }
+};
+
+}  // namespace
+
+TEST(Lighting_SsrBindingFailureStopsPreparationAndRecovers) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  // Two initial sets, six depth downsample sets, four colour downsample sets.
+  for (unsigned fail : {1u, 2u, 3u, 9u}) {
+    FailingBindings device(Device()->device());
+    LightingConfig config;
+    config.water = WaterReflections::kSsr;
+    SceneLighting lighting(&device, config);
+    CHECK(lighting.Initialize());
+    LightingScene scene(&device);
+    auto cl = device.createCommandList(nvrhi::CommandListParameters{});
+    cl->open();
+    cl->clearTextureFloat(scene.color, nvrhi::AllSubresources, nvrhi::Color(0.2f));
+    scene.Opaque(lighting, cl, 0);
+    device.fail_at = fail;
+    scene.Water(lighting, cl);
+    CHECK_EQ(device.calls, fail);  // no remaining passes attempted
+    CHECK(!lighting.ssr().valid);
+    CHECK_EQ(lighting.stats().ssr_prepared, uint64_t(0));
+    lighting.OnPresent(cl);
+    cl->close(); Device()->Execute(cl); Device()->WaitIdle();
+    device.fail_at = 0;
+    cl->open();
+    scene.Opaque(lighting, cl, 1);
+    scene.Water(lighting, cl);
+    CHECK(lighting.ssr().valid);
+    CHECK_EQ(lighting.stats().ssr_prepared, uint64_t(1));
+    CHECK_EQ(device.calls, fail + 12);
+    lighting.OnPresent(cl);
+    cl->close(); Device()->Execute(cl); Device()->WaitIdle();
+  }
+}
+
+TEST(Lighting_SsrUpcomingWaterWriteCannotValidateDepth) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  for (bool clear : {false, true}) {
+    LightingConfig config;
+    config.water = WaterReflections::kSsr;
+    SceneLighting lighting(Device()->device(), config);
+    CHECK(lighting.Initialize());
+    LightingScene scene(Device()->device());
+    auto cl = Device()->device()->createCommandList();
+    cl->open();
+    cl->clearTextureFloat(scene.color, nvrhi::AllSubresources, nvrhi::Color(0.2f));
+    // The first scene draw may itself write depth, but has not executed yet.
+    scene.draw.state.depth_write = clear;
+    scene.Opaque(lighting, cl, 0);
+    if (clear) lighting.OnDepthClear(0, scene.draw.depth.key);
+    scene.draw.state.depth_write = true;
+    scene.Water(lighting, cl);
+    CHECK(!lighting.ssr().valid);
+    CHECK_EQ(lighting.stats().ssr_no_scene, uint64_t(1));
+    CHECK_EQ(lighting.stats().ssr_prepared, uint64_t(0));
+    lighting.OnPresent(cl);
+    cl->close(); Device()->Execute(cl); Device()->WaitIdle();
+  }
+}
+
+TEST(Lighting_FogLastCompletesVolumetricsAtPresentOnce) {
+  if (!Device()) return;
+  ErrorsChecked errors;
+  for (bool shadow : {false, true}) {
+    LightingConfig config;
+    config.volumetrics = Volumetrics::kHigh;
+    config.gpu_time = true;
+    SceneLighting lighting(Device()->device(), config);
+    CHECK(lighting.Initialize());
+    LightingScene scene(Device()->device());
+    auto cl = Device()->device()->createCommandList();
+    cl->open();
+    cl->clearTextureFloat(scene.color, nvrhi::AllSubresources, nvrhi::Color(0.2f));
+    scene.Opaque(lighting, cl, 0);
+    SceneLighting::Fog fog;
+    fog.color[0] = fog.color[1] = fog.color[2] = 0.3f;
+    fog.params[2] = 1.0f; fog.params[3] = 0.04f;
+    fog.normalizing[0] = fog.normalizing[1] = -20.0f;
+    fog.normalizing[2] = 1.0f;
+    lighting.NoteFog(0, fog);
+    if (shadow) {
+      SceneLighting::ShadowQuad quad;
+      quad.depth = quad.shadow_map = scene.depth;
+      quad.light[0] = quad.light[5] = 0.02f;
+      quad.light[10] = -10.01f; quad.light[11] = 10.0f;
+      quad.light[14] = -20.0f; quad.light[15] = 20.0f;
+      lighting.NoteShadowQuad(0, quad);
+    }
+    scene.draw.family = LightFamily::kFog;
+    scene.draw.state.ps_hash = 0x1B65AC7429B67FE9ull;
+    lighting.OnDraw(cl, scene.draw);
+    CHECK_EQ(lighting.stats().volumetric, uint64_t(0));
+    lighting.OnPresent(cl);
+    CHECK_EQ(lighting.stats().volumetric, uint64_t(shadow ? 1 : 0));  // no light is invented without a map
+    CHECK_EQ(lighting.stats().volumetric_no_shadow, uint64_t(shadow ? 0 : 1));
+    lighting.OnPresent(cl);  // pending work was consumed with or without a shadow map
+    CHECK_EQ(lighting.stats().volumetric, uint64_t(shadow ? 1 : 0));
+    CHECK_EQ(lighting.stats().volumetric_no_shadow, uint64_t(shadow ? 0 : 1));
+    cl->close(); Device()->Execute(cl); Device()->WaitIdle();
+    cl->open();
+    scene.Opaque(lighting, cl, 1);  // a fog-free frame never reuses the pending pass
+    lighting.OnPresent(cl);
+    CHECK_EQ(lighting.stats().volumetric, uint64_t(shadow ? 1 : 0));
+    cl->close(); Device()->Execute(cl); Device()->WaitIdle();
+  }
+}
+
+NR_TEST_MAIN()
+
+// GPU cost of the GTAO compute (NR_BENCH=1 only; not a check): the scene at 1280x720 guest pixels drawn at
+// render scale 2 (2560x1440, DLSS Quality at 4K), full and half resolution, each sample quality,
+// timed with GPU timestamps over 60 runs (the median).
+TEST(Bench_GtaoGpuTime) {
+  if (!std::getenv("NR_BENCH") || !Device()) return;
+  VulkanTestDevice* gpu = Device();
+  nvrhi::IDevice* device = gpu->device();
+  Camera cam;
+  cam.Setup(1280.0f / 720.0f);
+  const float scale = 2.0f;
+  const AoScreen screen = Screen(1280.0f, 720.0f, scale);
+  const uint32_t w = 2560, h = 1440;
+  const std::vector<float> z = RayCast(cam, screen, w, h);
+  nvrhi::TextureHandle depth = DepthTexture(device, z, w, h);
+  float rows[16];
+  cam.Rows(rows);
+  for (bool half : {true, false}) {
+    for (int quality : {1, 2, 3}) {
+      for (bool temporal : {false, true}) {
+        Gtao gtao(device);
+        CHECK(gtao.Initialize());
+        GtaoInput in;
+        in.depth = depth;
+        in.width = w;
+        in.height = h;
+        in.screen = screen;
+        in.reprojection_valid = true;
+        CHECK(ExtractAoProjection(rows, in.projection));
+        GtaoSettings s;
+        s.half = half;
+        s.sample_quality = quality;
+        s.temporal = temporal;              // local history (no temporal upscaler)
+        s.temporal_upscaler = !temporal;    // an SDK upscaler smooths the rotating noise
+        std::vector<double> ms;
+        for (int i = 0; i < 70; ++i) {
+          in.frame = uint64_t(i + 1);
+          nvrhi::TimerQueryHandle q = device->createTimerQuery();
+          nvrhi::CommandListHandle cl = device->createCommandList();
+          cl->open();
+          cl->beginTimerQuery(q);
+          CHECK(gtao.Compute(cl, in, s) != nullptr);
+          cl->endTimerQuery(q);
+          cl->close();
+          gpu->Execute(cl);
+          gpu->WaitIdle();
+          if (i >= 10) ms.push_back(1000.0 * device->getTimerQueryTime(q));
+        }
+        std::sort(ms.begin(), ms.end());
+        std::printf("  BENCH GTAO 2560x1440 %s, samples %d (%s): median %.3f ms GPU\n", half ? "half" : "full", quality,
+                    temporal ? "local temporal" : "SDK upscaler", ms[ms.size() / 2]);
+      }
+    }
+  }
+}
+
+// GPU cost of normal smoothing (NR_BENCH=1 only; not a check): the scene at 1280x720 guest pixels drawn
+// at 1920x1080 and 3840x2160, full and half resolution, smoothing off / low / high (medium samples, no
+// temporal pass), the median of 60 timed runs of the whole Compute, then the difference to off.
+TEST(Bench_GtaoNormalSmoothing) {
+  if (!std::getenv("NR_BENCH") || !Device()) return;
+  VulkanTestDevice* gpu = Device();
+  nvrhi::IDevice* device = gpu->device();
+  Camera cam;
+  cam.Setup(1280.0f / 720.0f);
+  float rows[16];
+  cam.Rows(rows);
+  for (float scale : {1.5f, 3.0f}) {
+    const AoScreen screen = Screen(1280.0f, 720.0f, scale);
+    const uint32_t w = uint32_t(1280 * scale), h = uint32_t(720 * scale);
+    const std::vector<float> z = RayCast(cam, screen, w, h);
+    nvrhi::TextureHandle depth = DepthTexture(device, z, w, h);
+    for (bool half : {false, true}) {
+      double base = 0;
+      for (int level : {0, 1, 2}) {
+        Gtao gtao(device);
+        CHECK(gtao.Initialize());
+        GtaoInput in;
+        in.depth = depth;
+        in.width = w;
+        in.height = h;
+        in.screen = screen;
+        CHECK(ExtractAoProjection(rows, in.projection));
+        GtaoSettings s;
+        s.half = half;
+        s.normal_smoothing = level;
+        std::vector<double> ms;
+        for (int i = 0; i < 70; ++i) {
+          in.frame = uint64_t(i + 1);
+          nvrhi::TimerQueryHandle q = device->createTimerQuery();
+          nvrhi::CommandListHandle cl = device->createCommandList();
+          cl->open();
+          cl->beginTimerQuery(q);
+          CHECK(gtao.Compute(cl, in, s) != nullptr);
+          cl->endTimerQuery(q);
+          cl->close();
+          gpu->Execute(cl);
+          gpu->WaitIdle();
+          if (i >= 10) ms.push_back(1000.0 * device->getTimerQueryTime(q));
+        }
+        std::sort(ms.begin(), ms.end());
+        const double median = ms[ms.size() / 2];
+        if (level == 0) base = median;
+        std::printf("  BENCH GTAO smoothing %ux%u %s, level %d: median %.3f ms GPU (+%.3f)\n", w, h,
+                    half ? "half" : "full", level, median, median - base);
+      }
+    }
+  }
+}

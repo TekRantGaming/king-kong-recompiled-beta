@@ -1,0 +1,548 @@
+#include "platform.h"
+#include "hardware_recommendation.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <thread>
+#include <string>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_6.h>
+#include <shellapi.h>
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winmm.lib")
+#include <timeapi.h>
+#else
+#include <SDL3/SDL.h>
+#include <vulkan/vulkan.h>
+#include <algorithm>
+#include <cerrno>
+#include <dlfcn.h>
+#include <vector>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
+
+#include <imgui.h>
+
+#include <rex/logging.h>
+
+namespace kk {
+namespace {
+UiFonts g_fonts;
+}
+
+bool IsShiftHeld() {
+#if defined(_WIN32)
+  return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+#else
+  SDL_PumpEvents();
+  return (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+#endif
+}
+
+GpuInfo DetectGpu() {
+  GpuInfo info;
+#if defined(_WIN32)
+  IDXGIFactory1* factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return info;
+  IDXGIAdapter1* adapter = nullptr;
+  // Windows 10 1803 and later list the high-performance card first: the
+  // dedicated one if there is one. Older ones: the first that isn't software.
+  IDXGIFactory6* factory6 = nullptr;
+  if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory6), reinterpret_cast<void**>(&factory6)))) {
+    for (UINT i = 0; !adapter; ++i) {
+      IDXGIAdapter1* a = nullptr;
+      if (FAILED(factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, __uuidof(IDXGIAdapter1),
+                                                      reinterpret_cast<void**>(&a))))
+        break;
+      DXGI_ADAPTER_DESC1 d{};
+      if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) adapter = a;
+      else a->Release();
+    }
+    factory6->Release();
+  }
+  for (UINT i = 0; !adapter; ++i) {
+    IDXGIAdapter1* a = nullptr;
+    if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+    DXGI_ADAPTER_DESC1 d{};
+    if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) adapter = a;
+    else a->Release();
+  }
+  factory->Release();
+  if (!adapter) return info;
+  DXGI_ADAPTER_DESC1 d{};
+  if (SUCCEEDED(adapter->GetDesc1(&d))) {
+    info.vendor = d.VendorId == 0x10DE   ? GpuVendor::kNvidia
+                  : d.VendorId == 0x1002 ? GpuVendor::kAmd
+                  : d.VendorId == 0x8086 ? GpuVendor::kIntel
+                                         : GpuVendor::kUnknown;
+    char name[256] = {};
+    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+    info.name = name;
+    info.dedicated_memory = uint64_t(d.DedicatedVideoMemory);
+    info.vendor_id = d.VendorId;
+    info.device_id = d.DeviceId;
+    LARGE_INTEGER umd{};
+    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
+      char version[64];
+      std::snprintf(version, sizeof(version), "%u.%u.%u.%u", unsigned(HIWORD(umd.HighPart)),
+                    unsigned(LOWORD(umd.HighPart)), unsigned(HIWORD(umd.LowPart)), unsigned(LOWORD(umd.LowPart)));
+      info.driver = version;
+    }
+  }
+  adapter->Release();
+#else
+  // Linux: the Vulkan device the game draws with (the system's loader, as the renderer uses): a discrete
+  // card first, then an integrated one; never a software one (llvmpipe). Its largest device local heap
+  // stands for Windows' dedicated video memory (an APU's: the memory set aside for it in the firmware).
+  void* vk = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (!vk) return info;
+  auto get = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(vk, "vkGetInstanceProcAddr"));
+  auto create = get ? reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance")) : nullptr;
+  VkInstance instance = VK_NULL_HANDLE;
+  VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+  app.apiVersion = VK_API_VERSION_1_1;
+  VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+  ci.pApplicationInfo = &app;
+  if (create && create(&ci, nullptr, &instance) == VK_SUCCESS) {
+    auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(get(instance, "vkEnumeratePhysicalDevices"));
+    auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(get(instance, "vkGetPhysicalDeviceProperties"));
+    auto memory = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+        get(instance, "vkGetPhysicalDeviceMemoryProperties"));
+    auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(get(instance, "vkDestroyInstance"));
+    uint32_t count = 0;
+    if (enumerate && properties && memory && enumerate(instance, &count, nullptr) == VK_SUCCESS && count) {
+      std::vector<VkPhysicalDevice> devices(count);
+      enumerate(instance, &count, devices.data());
+      VkPhysicalDevice best = VK_NULL_HANDLE;
+      int best_rank = 0;
+      for (VkPhysicalDevice d : devices) {
+        VkPhysicalDeviceProperties p{};
+        properties(d, &p);
+        const int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 3
+                         : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
+                         : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU            ? 0
+                                                                                  : 1;
+        if (rank > best_rank) best = d, best_rank = rank;
+      }
+      if (best) {
+        VkPhysicalDeviceProperties p{};
+        properties(best, &p);
+        info.vendor = p.vendorID == 0x10DE   ? GpuVendor::kNvidia
+                      : p.vendorID == 0x1002 ? GpuVendor::kAmd
+                      : p.vendorID == 0x8086 ? GpuVendor::kIntel
+                                             : GpuVendor::kUnknown;
+        info.name = p.deviceName;
+        info.vendor_id = p.vendorID;
+        info.device_id = p.deviceID;
+        char version[64];
+        std::snprintf(version, sizeof(version), "%u.%u.%u", VK_API_VERSION_MAJOR(p.driverVersion),
+                      VK_API_VERSION_MINOR(p.driverVersion), VK_API_VERSION_PATCH(p.driverVersion));
+        info.driver = version;
+        VkPhysicalDeviceMemoryProperties m{};
+        memory(best, &m);
+        for (uint32_t i = 0; i < m.memoryHeapCount; ++i)
+          if (m.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            info.dedicated_memory = std::max<uint64_t>(info.dedicated_memory, m.memoryHeaps[i].size);
+      }
+    }
+    if (destroy) destroy(instance, nullptr);
+  }
+  dlclose(vk);
+#endif
+  return info;
+}
+
+HardwareProfile DetectHardware() {
+  HardwareProfile h;
+  h.gpu = DetectGpu();
+  h.steam_deck = IsSteamDeck();
+#if defined(_WIN32)
+  MEMORYSTATUSEX memory{sizeof(memory)};
+  if (GlobalMemoryStatusEx(&memory)) h.system_memory = memory.ullTotalPhys;
+  DWORD bytes = 0;
+  GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+  std::vector<unsigned char> topology(bytes);
+  if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore,
+      reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(topology.data()), &bytes)) {
+    for (DWORD offset = 0; offset < bytes;) {
+      const auto* core = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(topology.data() + offset);
+      if (!core->Size || core->Size > bytes - offset) break;
+      if (core->Relationship == RelationProcessorCore) ++h.physical_cores;
+      offset += core->Size;
+    }
+  }
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode)) {
+    h.width = int(mode.dmPelsWidth);
+    h.height = int(mode.dmPelsHeight);
+    h.refresh_hz = int(mode.dmDisplayFrequency);
+  }
+#else
+  // Linux: memory from the system, physical cores as distinct core ids per package, the primary display
+  // from SDL (the launcher has its video started; before that the size stays 0, as when Windows fails).
+  if (const long pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGE_SIZE); pages > 0 && size > 0)
+    h.system_memory = uint64_t(pages) * uint64_t(size);
+  std::vector<std::string> cores;
+  for (int cpu = 0;; ++cpu) {
+    const std::string dir = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+    std::ifstream package(dir + "physical_package_id"), core(dir + "core_id");
+    std::string p, c;
+    if (!std::getline(package, p) || !std::getline(core, c)) break;
+    if (std::find(cores.begin(), cores.end(), p + ":" + c) == cores.end()) cores.push_back(p + ":" + c);
+  }
+  h.physical_cores = unsigned(cores.size());
+  if (SDL_WasInit(SDL_INIT_VIDEO)) {
+    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
+      h.width = mode->w;
+      h.height = mode->h;
+      h.refresh_hz = int(mode->refresh_rate + 0.5f);
+    }
+  }
+#endif
+  return h;
+}
+
+bool IsSteamDeck() {
+  if (const char* v = std::getenv("SteamDeck"); v && std::string(v) == "1") return true;
+#if !defined(_WIN32)
+  std::ifstream board("/sys/devices/virtual/dmi/id/board_name");
+  std::string name;
+  std::getline(board, name);
+  if (name == "Jupiter" || name == "Galileo") return true;  // the LCD and OLED models
+#endif
+  return false;
+}
+
+bool InGamescope() {
+#if defined(_WIN32)
+  return false;
+#else
+  // gamescope gives its clients its own Wayland display; SteamOS style sessions also name it the desktop.
+  if (const char* v = std::getenv("GAMESCOPE_WAYLAND_DISPLAY"); v && *v) return true;
+  const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+  return desktop && std::strstr(desktop, "gamescope") != nullptr;
+#endif
+}
+
+bool ScreenHdrOn() {
+  if (const char* v = std::getenv("KK_DEV_SCREEN_HDR"); v && *v) return *v == '1';  // tests
+#if defined(_WIN32)
+  IDXGIFactory1* factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return false;
+  bool hdr = false;
+  IDXGIAdapter1* adapter = nullptr;
+  for (UINT a = 0; !hdr && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+    IDXGIOutput* output = nullptr;
+    for (UINT o = 0; !hdr && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+      IDXGIOutput6* output6 = nullptr;
+      if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
+        DXGI_OUTPUT_DESC1 desc{};
+        hdr = SUCCEEDED(output6->GetDesc1(&desc)) && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        output6->Release();
+      }
+      output->Release();
+    }
+    adapter->Release();
+  }
+  factory->Release();
+  return hdr;
+#else
+  if (!SDL_WasInit(SDL_INIT_VIDEO)) return false;
+  const SDL_DisplayID id = SDL_GetPrimaryDisplay();
+  const SDL_PropertiesID props = id ? SDL_GetDisplayProperties(id) : 0;
+  return props && SDL_GetBooleanProperty(props, SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN, false);
+#endif
+}
+
+std::pair<int, int> PrimaryScreenSize() {
+#if defined(_WIN32)
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode))
+    return {int(mode.dmPelsWidth), int(mode.dmPelsHeight)};
+#else
+  if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay()))
+    return {int(mode->w * mode->pixel_density), int(mode->h * mode->pixel_density)};
+#endif
+  return {1 << 16, 1 << 16};
+}
+
+std::vector<MonitorInfo> ListMonitors() {
+  std::vector<MonitorInfo> out;
+#if defined(_WIN32)
+  EnumDisplayMonitors(
+      nullptr, nullptr,
+      [](HMONITOR mon, HDC, LPRECT, LPARAM user) -> BOOL {
+        MONITORINFOEXW info{};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(mon, &info)) return TRUE;
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        MonitorInfo m;
+        if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) {
+          m.width = int(mode.dmPelsWidth);
+          m.height = int(mode.dmPelsHeight);
+        }
+        m.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        DISPLAY_DEVICEW dev{};
+        dev.cb = sizeof(dev);
+        std::wstring wname = EnumDisplayDevicesW(info.szDevice, 0, &dev, 0) ? dev.DeviceString : info.szDevice;
+        m.name.assign(wname.begin(), wname.end());  // device names are ASCII in practice
+        reinterpret_cast<std::vector<MonitorInfo>*>(user)->push_back(std::move(m));
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&out));
+#else
+  int count = 0;
+  SDL_DisplayID* ids = SDL_GetDisplays(&count);
+  const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+  for (int i = 0; ids && i < count; ++i) {
+    MonitorInfo m;
+    if (const char* name = SDL_GetDisplayName(ids[i])) m.name = name;
+    if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(ids[i])) {
+      m.width = int(mode->w * mode->pixel_density);
+      m.height = int(mode->h * mode->pixel_density);
+    }
+    m.primary = ids[i] == primary;
+    out.push_back(std::move(m));
+  }
+  SDL_free(ids);
+#endif
+  return out;
+}
+
+void RelaunchSelf(std::wstring_view extra_args) {
+#if defined(_WIN32)
+  std::wstring cmd = GetCommandLineW();
+  cmd += L" ";
+  cmd += extra_args;
+  wchar_t exe[MAX_PATH];
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  STARTUPINFOW si{sizeof(si)};
+  PROCESS_INFORMATION pi{};
+  const auto dir = std::filesystem::path(exe).parent_path();
+  if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  } else {
+    REXLOG_ERROR("KK: relaunch failed ({})", GetLastError());
+  }
+#else
+  // Same arguments as this run (from /proc/self/cmdline) plus the extras.
+  std::vector<std::string> args;
+  std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+  for (std::string arg; std::getline(cmdline, arg, '\0');) args.push_back(arg);
+  std::string extra;
+  for (wchar_t c : extra_args) extra += static_cast<char>(c);  // ASCII flags
+  args.push_back(extra);
+  // Inside an AppImage, relaunch the AppImage itself rather than the mounted binary.
+  const char* appimage = std::getenv("APPIMAGE");
+  const std::string exe = appimage ? appimage : std::filesystem::read_symlink("/proc/self/exe").string();
+  std::vector<char*> argv;
+  argv.push_back(const_cast<char*>(exe.c_str()));
+  for (size_t i = 1; i < args.size(); ++i) argv.push_back(args[i].data());
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  if (posix_spawn(&pid, exe.c_str(), nullptr, nullptr, argv.data(), environ) != 0)
+    REXLOG_ERROR("KK: relaunch failed");
+#endif
+}
+
+namespace {
+// Average real length of Sleep(1), in milliseconds.
+double MeasureSleep1() {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  for (int i = 0; i < 10; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  return std::chrono::duration<double, std::milli>(Clock::now() - start).count() / 10;
+}
+}  // namespace
+
+void TuneProcessScheduling() {
+#if defined(_WIN32)
+  const double before = MeasureSleep1();
+  const bool timer = timeBeginPeriod(1) == TIMERR_NOERROR;  // held until exit
+  PROCESS_POWER_THROTTLING_STATE throttling{};
+  throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+  throttling.StateMask = 0;  // opt out of both
+  const bool power = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+  REXLOG_INFO("KK: 1 ms sleep took {:.1f} ms, now {:.1f} ms (timer {}, power throttling off {})", before,
+              MeasureSleep1(), timer ? "1 ms" : "unchanged", power ? "yes" : "no");
+#endif
+}
+
+bool RunAndWait(const std::wstring& command_line) {
+#if defined(_WIN32)
+  std::wstring cmd = command_line;
+  STARTUPINFOW si{sizeof(si)};
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    return false;
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 1;
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return code == 0;
+#else
+  std::string cmd(command_line.begin(), command_line.end());
+  return std::system(cmd.c_str()) == 0;
+#endif
+}
+
+#if !defined(_WIN32)
+bool RunCapture(const std::vector<std::string>& argv, std::vector<uint8_t>& out, std::atomic<uint64_t>* bytes) {
+  int fds[2];
+  if (pipe(fds) != 0) return false;
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&actions, fds[0]);
+  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+  std::vector<char*> args;
+  for (const std::string& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+  args.push_back(nullptr);
+  std::vector<char*> env;  // without the AppImage's LD_LIBRARY_PATH
+  for (char** e = environ; *e; ++e)
+    if (std::strncmp(*e, "LD_LIBRARY_PATH=", 16) != 0) env.push_back(*e);
+  env.push_back(nullptr);
+  pid_t pid = 0;
+  const int rc = posix_spawnp(&pid, args[0], &actions, nullptr, args.data(), env.data());
+  posix_spawn_file_actions_destroy(&actions);
+  close(fds[1]);
+  if (rc != 0) {
+    close(fds[0]);
+    return false;
+  }
+  uint8_t buf[1 << 16];
+  for (;;) {
+    const ssize_t n = read(fds[0], buf, sizeof(buf));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    out.insert(out.end(), buf, buf + n);
+    if (bytes) *bytes += uint64_t(n);
+  }
+  close(fds[0]);
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif
+
+void OpenUrl(const std::string& url) {
+  if (url.rfind("https://", 0) != 0) return;  // web pages only
+#if defined(KK_DEV_TOOLS)
+  // Developer aid (scripted test runs): KK_DEV_NO_BROWSER=1 only logs the page.
+  if (const char* v = std::getenv("KK_DEV_NO_BROWSER"); v && *v) {
+    REXLOG_INFO("KK dev: open url {}", url);
+    return;
+  }
+#endif
+#if defined(_WIN32)
+  const std::wstring w(url.begin(), url.end());
+  ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+  const char* argv[] = {"xdg-open", url.c_str(), nullptr};
+  pid_t pid = 0;
+  posix_spawnp(&pid, "xdg-open", nullptr, nullptr, const_cast<char* const*>(argv), environ);
+#endif
+}
+
+void OpenInExplorer(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) && !path.has_extension()) std::filesystem::create_directories(path, ec);
+#if defined(_WIN32)
+  ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+  const std::string target = path.string();
+  const char* argv[] = {"xdg-open", target.c_str(), nullptr};
+  pid_t pid = 0;
+  if (posix_spawnp(&pid, "xdg-open", nullptr, nullptr, const_cast<char* const*>(argv), environ) != 0)
+    REXLOG_WARN("KK: could not run xdg-open for {}", target);
+#endif
+}
+
+void LoadUiFont(ImFontAtlas* atlas) {
+  // Latin-1 plus General Punctuation: the game's achievement text uses curly
+  // quotes (as in "Kong's power").
+  static const ImWchar kRanges[] = {0x0020, 0x00FF, 0x2010, 0x205E, 0};
+  auto load = [&](const std::filesystem::path& path) -> ImFont* {
+    std::error_code ec;
+    return !path.empty() && std::filesystem::exists(path, ec)
+               ? atlas->AddFontFromFileTTF(path.string().c_str(), 18.0f, nullptr, kRanges)
+               : nullptr;
+  };
+#if defined(_WIN32)
+  wchar_t windir[MAX_PATH];
+  if (GetWindowsDirectoryW(windir, MAX_PATH)) {
+    const auto fonts = std::filesystem::path(windir) / "Fonts";
+    if ((g_fonts.regular = load(fonts / "segoeui.ttf"))) {
+      g_fonts.semibold = load(fonts / "seguisb.ttf");
+      g_fonts.bold = load(fonts / "segoeuib.ttf");
+      g_fonts.display = load(fonts / "bahnschrift.ttf");
+    }
+  }
+  // Under Wine (Proton on Linux) there are no Windows fonts: the system's
+  // below, through Wine's Z: drive (the Linux root).
+  const std::string root = g_fonts.regular ? "" : "Z:";
+#else
+  const std::string root;
+#endif
+  // Common Linux UI fonts; the first family found wins. The display font stands
+  // in for Bahnschrift (narrow, DIN-like): a semi-condensed or condensed cut.
+  struct Family { const char* regular; const char* semibold; const char* bold; const char* display; };
+  static const Family kFamilies[] = {
+      {"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+       "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-SemiCondensedMedium.ttf"},
+      {"/usr/share/fonts/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+       "/usr/share/fonts/noto/NotoSans-Bold.ttf", "/usr/share/fonts/noto/NotoSans-SemiCondensedMedium.ttf"},
+      {"/usr/share/fonts/google-noto/NotoSans-Regular.ttf", "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf",
+       "/usr/share/fonts/google-noto/NotoSans-Bold.ttf", "/usr/share/fonts/google-noto/NotoSans-SemiCondensedMedium.ttf"},
+      {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", nullptr, "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+       "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"},
+      {"/usr/share/fonts/TTF/DejaVuSans.ttf", nullptr, "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+       "/usr/share/fonts/TTF/DejaVuSansCondensed.ttf"},
+      {"/usr/share/fonts/dejavu/DejaVuSans.ttf", nullptr, "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+       "/usr/share/fonts/dejavu/DejaVuSansCondensed.ttf"},
+      {"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", nullptr,
+       "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", nullptr},
+  };
+  auto file = [&](const char* path) { return path ? std::filesystem::path(root + path) : std::filesystem::path(); };
+  for (const auto& f : kFamilies) {
+    if (g_fonts.regular) break;  // Windows' own, or the family just loaded
+    if (!(g_fonts.regular = load(file(f.regular)))) continue;
+    g_fonts.semibold = load(file(f.semibold ? f.semibold : f.bold));
+    g_fonts.bold = load(file(f.bold));
+    g_fonts.display = load(file(f.display));
+  }
+  if (g_fonts.regular) ImGui::GetIO().FontDefault = g_fonts.regular;
+  if (!g_fonts.semibold) g_fonts.semibold = g_fonts.regular;
+  if (!g_fonts.bold) g_fonts.bold = g_fonts.regular;
+  if (!g_fonts.display) g_fonts.display = g_fonts.bold;
+}
+
+const UiFonts& GetUiFonts() { return g_fonts; }
+
+}  // namespace kk

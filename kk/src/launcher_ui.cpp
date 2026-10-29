@@ -1,0 +1,1448 @@
+#include "launcher_ui.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
+
+#include <SDL3/SDL.h>
+
+#include <rex/ui/immediate_drawer.h>
+
+#include "art.h"
+#include "glyphs.h"
+#include "launcher_text.h"
+#include "platform.h"
+#include "settings_help.h"
+#include "steam_pad.h"
+#include "toast.h"
+
+namespace kk::ui {
+
+using text::T;
+
+namespace {
+
+// A controller press and a key press of the same action this close together
+// are one press (Steam's desktop layout types keys for the controller).
+constexpr double kSameInput = 0.25;
+
+double SteadySeconds() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int Utf8Length(unsigned char c) {
+  return c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+}
+
+bool MouseIn(ImVec2 a, ImVec2 b) { return ImGui::IsMouseHoveringRect(a, b, false); }
+
+// Triangles in ImGui's winding (clockwise on screen).
+void ArrowLeft(ImDrawList* dl, float x, float cy, float w, float h, ImU32 c) {
+  dl->AddTriangleFilled(ImVec2(x, cy), ImVec2(x + w, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), c);
+}
+void ArrowRight(ImDrawList* dl, float x, float cy, float w, float h, ImU32 c) {
+  dl->AddTriangleFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy), ImVec2(x, cy + h * 0.5f), c);
+}
+
+std::function<void(Sound, float)> g_sound;
+
+}  // namespace
+
+void SetSoundHandler(std::function<void(Sound, float)> handler) { g_sound = std::move(handler); }
+void Cue(Sound sound, float value) {
+  if (g_sound) g_sound(sound, value);
+}
+
+ImU32 WithAlpha(ImU32 c, float alpha) {
+  const float a = float((c >> IM_COL32_A_SHIFT) & 0xFF) * std::clamp(alpha, 0.0f, 1.0f);
+  return (c & ~IM_COL32_A_MASK) | (ImU32(a + 0.5f) << IM_COL32_A_SHIFT);
+}
+
+ImTextureRef Tex(rex::ui::ImmediateTexture* t) { return ImTextureRef(reinterpret_cast<ImTextureID>(t)); }
+
+Fonts GetFonts() {
+  const UiFonts& f = GetUiFonts();
+  Fonts out;
+  out.text = f.regular ? f.regular : ImGui::GetFont();
+  out.semibold = f.semibold ? f.semibold : out.text;
+  out.display = f.display ? f.display : (f.bold ? f.bold : out.text);
+  return out;
+}
+
+ImVec2 TextSize(ImFont* font, float size, const std::string& text, float wrap) {
+  return font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str(), text.c_str() + text.size());
+}
+
+float TrackedWidth(ImFont* font, float size, const std::string& text, float tracking) {
+  float w = 0;
+  int n = 0;
+  for (size_t i = 0; i < text.size();) {
+    const size_t len = std::min<size_t>(Utf8Length(uint8_t(text[i])), text.size() - i);
+    w += font->CalcTextSizeA(size, FLT_MAX, 0, text.c_str() + i, text.c_str() + i + len).x;
+    i += len;
+    ++n;
+  }
+  return n ? w + tracking * float(n - 1) : 0.0f;
+}
+
+void DrawTracked(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, ImU32 col, const std::string& text,
+                 float tracking) {
+  float x = pos.x;
+  for (size_t i = 0; i < text.size();) {
+    const size_t len = std::min<size_t>(Utf8Length(uint8_t(text[i])), text.size() - i);
+    const char* s = text.c_str() + i;
+    dl->AddText(font, size, ImVec2(std::round(x), pos.y), col, s, s + len);
+    x += font->CalcTextSizeA(size, FLT_MAX, 0, s, s + len).x + tracking;
+    i += len;
+  }
+}
+
+std::string Ellipsize(ImFont* font, float size, const std::string& text, float width) {
+  if (width <= 0) return {};
+  if (TextSize(font, size, text).x <= width) return text;
+  static const std::string kEllipsis = "\xE2\x80\xA6";
+  std::string out = text;
+  while (!out.empty()) {
+    // Drop the last whole character.
+    size_t cut = out.size() - 1;
+    while (cut > 0 && (uint8_t(out[cut]) & 0xC0) == 0x80) --cut;
+    out.erase(cut);
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (TextSize(font, size, out + kEllipsis).x <= width) return out + kEllipsis;
+  }
+  return kEllipsis;
+}
+
+float Approach(float v, float target, float rate) {
+  const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
+  v += (target - v) * (1.0f - std::exp(-rate * dt));
+  return std::abs(target - v) < 0.3f ? target : v;
+}
+
+// ------------------------------------------------------------------ input ---
+// Controller buttons the launcher uses, in buttons_down_.
+enum PadButton { kPadA, kPadB, kPadX, kPadY, kPadLB, kPadRB, kPadStart, kPadBack };
+
+Input::Input(bool own_gamepads) {
+  // This SDL copy is separate from the runtime's on Windows. Keep device
+  // sampling independent of SDL focus; the native-window gate below decides
+  // which instance may act on a pad. A windowless SDL alone does not suppress
+  // joystick events, so this hint is not evidence of Craig's failure's cause.
+#if defined(_WIN32)
+  if (own_gamepads) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#endif
+  // The program's own SDL (the game's input runs in the runtime's): only
+  // while the launcher is open. Gamepads already connected arrive as events.
+  // KK_DEV_NO_PADS (tests): the controllers are left alone, so one in use in another program cannot press anything.
+  sdl_ready_ = own_gamepads && !std::getenv("KK_DEV_NO_PADS") && SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+  pad_held_at_.fill(-1e9);
+  key_pressed_at_.fill(-1e9);
+}
+
+Input::~Input() { Release(); }
+
+void Input::Release() {
+  for (void* p : pads_) SDL_CloseGamepad(static_cast<SDL_Gamepad*>(p));
+  pads_.clear();
+  if (sdl_ready_) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+  sdl_ready_ = false;
+}
+
+bool Input::RepeatHeld(Repeat& r, bool down, double now) {
+  return r.Update(down, now);
+}
+
+float Input::HeldFor(Action a) const {
+  const size_t i = size_t(a);
+  return i < held_.size() ? held_[i] : 0.0f;
+}
+
+void Input::Inject(Action a, Device d) {
+  pressed_[size_t(a)] = true;
+  injected_ = true;
+  device_ = d;
+  if (d != Device::kKeyboard) {  // task 357: as the controller's own press
+    static constexpr uint32_t kBits[kActionCount] = {kPadUp, kPadDown, kPadLeft, kPadRight, kPadLT, kPadRT, kPadA,
+                                                     kPadB,  kPadX,    kPadY,    kPadLB,    kPadRB, kPadStart};
+    pad_presses_ |= kBits[size_t(a)];
+  }
+  if (d != Device::kKeyboard) pad_device_ = d;
+  if (d != Device::kKeyboard) pad_style_ = d == Device::kPlayStation ? "ps5" : "xbox360";
+}
+
+void Input::FeedPad(uint16_t xinput_buttons, int16_t lx, int16_t ly, uint8_t lt, uint8_t rt) {
+  fed_ = {xinput_buttons, lx, ly, lt, rt, ImGui::GetTime()};
+}
+
+void Input::UpdateGamepads(double now) {
+  if (sdl_ready_) {
+    // Enumerate state rather than depending on queued hotplug events, which
+    // may already have been drained by the session's cursor observer.
+    SDL_UpdateGamepads();
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    for (int i = 0; i < count; ++i) {
+      bool open = false;
+      for (void* pad : pads_) open |= SDL_GetGamepadID(static_cast<SDL_Gamepad*>(pad)) == ids[i];
+      if (!open) if (SDL_Gamepad* pad = SDL_OpenGamepad(ids[i])) pads_.push_back(pad);
+    }
+    SDL_free(ids);
+    for (auto it = pads_.begin(); it != pads_.end();) {
+      auto* pad = static_cast<SDL_Gamepad*>(*it);
+      if (SDL_GamepadConnected(pad)) { ++it; continue; }
+      SDL_CloseGamepad(pad); it = pads_.erase(it);
+    }
+  }
+  SDL_Event e;
+#if defined(_WIN32)
+  // The program's own SDL (the runtime DLL has its own): everything queued is ours.
+  auto next = [&e] { return SDL_PollEvent(&e); };
+#else
+  // Elsewhere the program and the runtime share one SDL, whose queue also holds
+  // the window's events (its paint requests, keys and the mouse): take only the
+  // controllers' and leave the rest for the window.
+  if (sdl_ready_) SDL_PumpEvents();
+  auto next = [&e] {
+    return SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_FINGER_DOWN - 1) > 0;
+  };
+#endif
+  while (sdl_ready_ && next()) {}  // state and hotplug were read above
+  std::array<bool, 8> down{};
+  bool dir[6] = {};
+  sticks_ = {};
+  // The strongest stick / trigger of all controllers, with a dead zone (the rest rescaled to 0..1).
+  auto strongest = [](float& into, float v, float dead) {
+    const float a = std::abs(v);
+    if (a <= dead) return;
+    const float scaled = std::min(1.0f, (a - dead) / (1.0f - dead)) * (v < 0 ? -1.0f : 1.0f);
+    if (std::abs(scaled) > std::abs(into)) into = scaled;
+  };
+  for (void* p : pads_) {
+    auto* g = static_cast<SDL_Gamepad*>(p);
+    auto b = [g](SDL_GamepadButton button) { return SDL_GetGamepadButton(g, button); };
+    const float lx = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
+    const float ly = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;
+    const float lt = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0f;
+    const float rt = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0f;
+    if (pads_active_) {
+      strongest(sticks_.lx, lx, 0.2f);
+      strongest(sticks_.ly, ly, 0.2f);
+      strongest(sticks_.rx, SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX) / 32767.0f, 0.2f);
+      strongest(sticks_.ry, SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY) / 32767.0f, 0.2f);
+      strongest(sticks_.lt, lt, 0.08f);
+      strongest(sticks_.rt, rt, 0.08f);
+    }
+    // A stick direction counts once it's well past the middle, and keeps
+    // counting until it's nearly back (no flicker at the edge).
+    auto past = [](float v, bool was) { return v > (was ? 0.35f : 0.55f); };
+    const bool pad_dir[6] = {
+        b(SDL_GAMEPAD_BUTTON_DPAD_UP) || past(-ly, dir_[0].held),
+        b(SDL_GAMEPAD_BUTTON_DPAD_DOWN) || past(ly, dir_[1].held),
+        b(SDL_GAMEPAD_BUTTON_DPAD_LEFT) || past(-lx, dir_[2].held),
+        b(SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || past(lx, dir_[3].held),
+        // Task 364: past halfway, and held until nearly let go (a trigger held for a code does not flicker).
+        // A digital trigger (Switch ZL and ZR) is a full axis in SDL, so it counts the same.
+        past(lt, dir_[4].held),
+        past(rt, dir_[5].held),
+    };
+    const bool pad_down[8] = {b(SDL_GAMEPAD_BUTTON_SOUTH),         b(SDL_GAMEPAD_BUTTON_EAST),
+                              b(SDL_GAMEPAD_BUTTON_WEST),          b(SDL_GAMEPAD_BUTTON_NORTH),
+                              b(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER), b(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER),
+                              b(SDL_GAMEPAD_BUTTON_START),         b(SDL_GAMEPAD_BUTTON_BACK)};
+    bool any = false;
+    for (int i = 0; i < 6; ++i) {
+      dir[i] = dir[i] || pad_dir[i];
+      any = any || pad_dir[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+      down[size_t(i)] = down[size_t(i)] || pad_down[i];
+      any = any || (pad_down[i] && !buttons_down_[size_t(i)]);
+    }
+    if (any && pads_active_) {
+      const SDL_GamepadType type = SDL_GetGamepadType(g);
+      const bool ps = type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 || type == SDL_GAMEPAD_TYPE_PS5;
+      pad_device_ = device_ = ps ? Device::kPlayStation : Device::kXbox;
+      pad_style_ = PadPromptsFor(type, SDL_GetGamepadName(g));
+    }
+  }
+  // C82: the pad Steam Input holds while Steam runs us as app 480 (steam_pad.h) counts like one more
+  // controller. Steam hides that physical pad from SDL then, so nothing is counted twice.
+  if (steam_pad::State sp; steam_pad::Read(sp, steam_pad::Now())) {
+    const uint16_t b = sp.buttons;
+    const float lx = sp.lx / 32767.0f, ly = -sp.ly / 32767.0f;  // XInput's up is positive, SDL's down
+    const float lt = sp.lt / 255.0f, rt = sp.rt / 255.0f;
+    if (pads_active_) {
+      strongest(sticks_.lx, lx, 0.2f);
+      strongest(sticks_.ly, ly, 0.2f);
+      strongest(sticks_.rx, sp.rx / 32767.0f, 0.2f);
+      strongest(sticks_.ry, -sp.ry / 32767.0f, 0.2f);
+      strongest(sticks_.lt, lt, 0.08f);
+      strongest(sticks_.rt, rt, 0.08f);
+    }
+    auto past = [](float v, bool was) { return v > (was ? 0.35f : 0.55f); };
+    const bool pad_dir[6] = {(b & 0x0001) || past(-ly, dir_[0].held), (b & 0x0002) || past(ly, dir_[1].held),
+                             (b & 0x0004) || past(-lx, dir_[2].held), (b & 0x0008) || past(lx, dir_[3].held),
+                             past(lt, dir_[4].held), past(rt, dir_[5].held)};
+    const bool pad_down[8] = {bool(b & 0x1000), bool(b & 0x2000), bool(b & 0x4000), bool(b & 0x8000),
+                              bool(b & 0x0100), bool(b & 0x0200), bool(b & 0x0010), bool(b & 0x0020)};
+    bool any = false;
+    for (int i = 0; i < 6; ++i) {
+      dir[i] = dir[i] || pad_dir[i];
+      any = any || pad_dir[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+      down[size_t(i)] = down[size_t(i)] || pad_down[i];
+      any = any || (pad_down[i] && !buttons_down_[size_t(i)]);
+    }
+    if (any && pads_active_) {
+      pad_device_ = device_ = Device::kXbox;
+      pad_style_ = "xbox360";
+    }
+  }
+  // Not the active window: the controllers press nothing (another program has them). What they hold then is
+  // remembered, so it does not press when the window comes back: a button counts once let go and pressed
+  // again, a direction once let go.
+  for (size_t i = 0; i < 6; ++i) {
+    if (!dir[i]) dir_stale_[i] = false;
+    else if (!pads_active_) dir_stale_[i] = true;
+    if (dir_stale_[i]) dir[i] = false;
+  }
+  if (!pads_active_)
+    for (size_t i = 0; i < 8; ++i) buttons_down_[i] = buttons_down_[i] || down[i];
+  // Task 357: the controller's new presses this frame (a direction once, however long it is held).
+  {
+    static constexpr uint32_t kDirBits[6] = {kPadUp, kPadDown, kPadLeft, kPadRight, kPadLT, kPadRT};
+    static constexpr uint32_t kButtonBits[8] = {kPadA, kPadB, kPadX, kPadY, kPadLB, kPadRB, kPadStart, kPadBack};
+    for (size_t i = 0; i < 6; ++i)
+      if (dir[i] && !dir_[i].held && pads_active_) pad_presses_ |= kDirBits[i];
+    for (size_t i = 0; i < 8; ++i)
+      if (down[i] && !buttons_down_[i]) pad_presses_ |= kButtonBits[i];
+    // Task 364: what is held down now (the Home codes entered while shoulder buttons are held).
+    pad_held_ = 0;
+    if (pads_active_) {
+      for (size_t i = 0; i < 6; ++i)
+        if (dir[i]) pad_held_ |= kDirBits[i];
+      for (size_t i = 0; i < 8; ++i)
+        if (down[i]) pad_held_ |= kButtonBits[i];
+    }
+  }
+  // In game: the pad the game read (FeedPad), XInput's layout.
+  if (now - fed_.at < 0.25) {
+    const uint16_t b = fed_.buttons;
+    const float lx = fed_.lx / 32767.0f, ly = -fed_.ly / 32767.0f;  // XInput's up is positive
+    auto past = [](float v, bool was) { return v > (was ? 0.35f : 0.55f); };
+    const bool pad_dir[6] = {(b & 0x0001) || past(-ly, dir_[0].held), (b & 0x0002) || past(ly, dir_[1].held),
+                             (b & 0x0004) || past(-lx, dir_[2].held), (b & 0x0008) || past(lx, dir_[3].held),
+                             fed_.lt > 128, fed_.rt > 128};
+    const bool pad_down[8] = {bool(b & 0x1000), bool(b & 0x2000), bool(b & 0x4000), bool(b & 0x8000),
+                              bool(b & 0x0100), bool(b & 0x0200), bool(b & 0x0010), bool(b & 0x0020)};
+    bool any = false;
+    for (int i = 0; i < 6; ++i) {
+      dir[i] = dir[i] || pad_dir[i];
+      any = any || pad_dir[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+      down[size_t(i)] = down[size_t(i)] || pad_down[i];
+      any = any || (pad_down[i] && !buttons_down_[size_t(i)]);
+    }
+    if (any) device_ = pad_device_;
+  }
+  // A press the keyboard just reported (typed by Steam for this controller) already counted.
+  auto press = [&](Action a) {
+    const size_t i = size_t(a);
+    if (now - key_pressed_at_[i] < kSameInput) {
+      key_pressed_at_[i] = -1e9;  // consume this echo pair, not the next rapid physical press
+    } else {
+      pressed_[i] = true;
+    }
+  };
+  static constexpr Action kDirActions[6] = {Action::kUp,   Action::kDown,   Action::kLeft,
+                                            Action::kRight, Action::kPageUp, Action::kPageDown};
+  for (size_t i = 0; i < 6; ++i) {
+    const bool repeated = RepeatHeld(dir_[i], dir[i], now);
+    if (repeated) press(kDirActions[i]);
+    if (dir[i]) {
+      held_[size_t(kDirActions[i])] = float(now - dir_[i].since);
+      pad_held_at_[size_t(kDirActions[i])] = now;
+    }
+  }
+  static constexpr Action kButtonActions[8] = {Action::kAccept,  Action::kBack,    Action::kDefault,
+                                               Action::kResetPage, Action::kPrevTab, Action::kNextTab,
+                                               Action::kPlay,    Action::kCount};
+  for (size_t i = 0; i < 8; ++i) {
+    if (!down[i] || kButtonActions[i] == Action::kCount) continue;
+    if (!buttons_down_[i]) press(kButtonActions[i]);
+    pad_held_at_[size_t(kButtonActions[i])] = now;
+  }
+  buttons_down_ = down;
+}
+
+void Input::Update() {
+  pressed_ = {};
+  pad_presses_ = 0;
+  key_presses_ = 0;
+  injected_ = false;
+  held_ = {};
+  const double now = ImGui::GetTime();
+  const ImGuiIO& io = ImGui::GetIO();
+
+  // The mouse: moving it or clicking switches the prompts to the keyboard's.
+  mouse_moved_ = false;
+  if (ImGui::IsMousePosValid(&io.MousePos)) {
+    if (last_mouse_.x >= 0 &&
+        (std::abs(io.MousePos.x - last_mouse_.x) > 1.5f || std::abs(io.MousePos.y - last_mouse_.y) > 1.5f)) {
+      mouse_moved_ = true;
+      device_ = Device::kKeyboard;
+    }
+    last_mouse_ = io.MousePos;
+  }
+  if (ImGui::IsMouseClicked(0) || io.MouseWheel != 0) device_ = Device::kKeyboard;
+
+  UpdateGamepads(now);  // first: a key typed for a held controller button is skipped
+  // A key for an action a controller is holding (or just let go of) is that controller's press.
+  auto from_pad = [&](Action a) { return now - pad_held_at_[size_t(a)] < kSameInput; };
+  if (keyboard_enabled_) {
+    struct Key {
+      ImGuiKey key;
+      Action action;
+      bool repeat;
+    };
+    static const Key kKeys[] = {
+        {ImGuiKey_UpArrow, Action::kUp, true},          {ImGuiKey_DownArrow, Action::kDown, true},
+        {ImGuiKey_LeftArrow, Action::kLeft, true},      {ImGuiKey_RightArrow, Action::kRight, true},
+        {ImGuiKey_PageUp, Action::kPageUp, true},       {ImGuiKey_PageDown, Action::kPageDown, true},
+        {ImGuiKey_Enter, Action::kAccept, false},       {ImGuiKey_KeypadEnter, Action::kAccept, false},
+        {ImGuiKey_Space, Action::kAccept, false},       {ImGuiKey_Escape, Action::kBack, false},
+        {ImGuiKey_Backspace, Action::kBack, false},     {ImGuiKey_Delete, Action::kDefault, false},
+        {ImGuiKey_R, Action::kResetPage, false},        {ImGuiKey_Q, Action::kPrevTab, true},
+        {ImGuiKey_E, Action::kNextTab, true},           {ImGuiKey_P, Action::kPlay, false},
+    };
+    const bool ctrl_or_alt = io.KeyCtrl || io.KeyAlt;
+    for (const Key& k : kKeys) {
+      if (ctrl_or_alt || !ImGui::IsKeyPressed(k.key, k.repeat) || from_pad(k.action)) continue;
+      pressed_[size_t(k.action)] = true;
+      key_pressed_at_[size_t(k.action)] = now;
+      device_ = Device::kKeyboard;
+    }
+    // Task 358: the keyboard's new presses for the Home code (key_presses): every keyboard key but the
+    // modifiers (the gamepad and mouse entries come after the keyboard's in ImGuiKey). A key that stands for a
+    // launcher action a controller is holding (Steam's desktop layout typing it) is skipped.
+    if (!ctrl_or_alt)
+      for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_GamepadStart; ++k) {
+        const ImGuiKey key = ImGuiKey(k);
+        if ((key >= ImGuiKey_LeftCtrl && key <= ImGuiKey_RightSuper) || !ImGui::IsKeyPressed(key, false)) continue;
+        Action same = key == ImGuiKey_Tab ? Action::kNextTab : Action::kCount;
+        for (const Key& known : kKeys)
+          if (known.key == key) same = known.action;
+        if (same != Action::kCount && from_pad(same)) continue;
+        switch (key) {
+          case ImGuiKey_UpArrow: key_presses_ |= kPadUp; break;
+          case ImGuiKey_DownArrow: key_presses_ |= kPadDown; break;
+          case ImGuiKey_LeftArrow: key_presses_ |= kPadLeft; break;
+          case ImGuiKey_RightArrow: key_presses_ |= kPadRight; break;
+          case ImGuiKey_B: key_presses_ |= kPadB; break;
+          case ImGuiKey_A: key_presses_ |= kPadA; break;
+          case ImGuiKey_Enter:
+          case ImGuiKey_KeypadEnter: key_presses_ |= kPadStart; break;
+          default: key_presses_ |= kKeyOther; break;
+        }
+      }
+    const Action tab = io.KeyShift ? Action::kPrevTab : Action::kNextTab;
+    if (!ctrl_or_alt && ImGui::IsKeyPressed(ImGuiKey_Tab, true) && !from_pad(tab)) {
+      pressed_[size_t(tab)] = true;
+      key_pressed_at_[size_t(tab)] = now;
+      device_ = Device::kKeyboard;
+    }
+    static constexpr std::pair<ImGuiKey, Action> kHeld[] = {{ImGuiKey_UpArrow, Action::kUp},
+                                                            {ImGuiKey_DownArrow, Action::kDown},
+                                                            {ImGuiKey_LeftArrow, Action::kLeft},
+                                                            {ImGuiKey_RightArrow, Action::kRight}};
+    for (size_t i = 0; i < std::size(kHeld); ++i) {
+      key_held_[i] = ImGui::IsKeyDown(kHeld[i].first) ? key_held_[i] + io.DeltaTime : 0.0f;
+      held_[size_t(kHeld[i].second)] = std::max(held_[size_t(kHeld[i].second)], key_held_[i]);
+    }
+  }
+  // Settle: everything above was followed (what is held stays held, so it does not press later either), but
+  // nothing presses yet. The steady clock: ImGui's stood still while the launcher waited.
+  if (SteadySeconds() < settle_until_) {
+    pressed_ = {};
+    pad_presses_ = key_presses_ = 0;
+  }
+}
+
+void Input::Settle(double seconds) {
+  settle_until_ = SteadySeconds() + seconds;
+  pressed_ = {};
+  pad_presses_ = key_presses_ = 0;
+}
+
+// --------------------------------------------------------------- prompts ---
+Glyphs::Glyphs(rex::ui::ImmediateDrawer* drawer, std::filesystem::path dir)
+    : drawer_(drawer), dir_(std::move(dir)) {}
+
+Glyphs::~Glyphs() { Reload(); }
+
+void Glyphs::AddSet(const std::string& set, std::filesystem::path dir) { set_dirs_[set] = std::move(dir); }
+
+void Glyphs::Reload() {
+  for (auto& [name, entry] : cache_)
+    if (entry.texture) KeepTextureAlive(std::move(entry.texture));
+  cache_.clear();
+}
+
+rex::ui::ImmediateTexture* Glyphs::Named(const std::string& set, const std::string& name, float* aspect) {
+  const std::string key = set + "/" + name;
+  auto it = cache_.find(key);
+  if (it == cache_.end()) {
+    Entry entry;
+    const auto custom = set_dirs_.find(set);
+    const auto path = custom != set_dirs_.end() ? custom->second / (name + ".bmp") : dir_ / set / (name + ".png");
+    if (const auto img = art::LoadImage(path); img && drawer_) {
+      entry.texture = drawer_->CreateTexture(uint32_t(img.width), uint32_t(img.height),
+                                             rex::ui::ImmediateTextureFilter::kLinear, false, img.rgba.data());
+      entry.aspect = float(img.width) / float(img.height);
+    }
+    it = cache_.emplace(key, std::move(entry)).first;
+  }
+  if (aspect) *aspect = it->second.aspect;
+  return it->second.texture.get();
+}
+
+rex::ui::ImmediateTexture* Glyphs::Get(Action a, const std::string& set, float* aspect) {
+  if (set == "keyboard") {
+    const char* name = nullptr;
+    switch (a) {
+      case Action::kUp: name = "Arrow_Up"; break;
+      case Action::kDown: name = "Arrow_Down"; break;
+      case Action::kLeft: name = "Arrow_Left"; break;
+      case Action::kRight: name = "Arrow_Right"; break;
+      case Action::kPageUp: name = "Page_Up"; break;
+      case Action::kPageDown: name = "Page_Down"; break;
+      case Action::kAccept: name = "Enter"; break;
+      case Action::kBack: name = "Esc"; break;
+      case Action::kDefault: name = "Del"; break;
+      case Action::kResetPage: name = "R"; break;
+      case Action::kPrevTab: name = "Q"; break;
+      case Action::kNextTab: name = "E"; break;
+      case Action::kPlay: name = "P"; break;
+      default: return nullptr;
+    }
+    return Named("keyboard", name, aspect);
+  }
+  const char* name = nullptr;
+  switch (a) {
+    case Action::kUp: name = "dpad_up"; break;
+    case Action::kDown:
+    case Action::kLeft:
+    case Action::kRight: name = "dpad"; break;
+    case Action::kPageUp: name = "lt"; break;
+    case Action::kPageDown: name = "rt"; break;
+    case Action::kAccept: name = "a"; break;
+    case Action::kBack: name = "b"; break;
+    case Action::kDefault: name = "x"; break;
+    case Action::kResetPage: name = "y"; break;
+    case Action::kPrevTab: name = "lb"; break;
+    case Action::kNextTab: name = "rb"; break;
+    case Action::kPlay: name = "start"; break;
+    default: return nullptr;
+  }
+  rex::ui::ImmediateTexture* t = Named(set, name, aspect);
+  return t || set == "xbox_series" ? t : Named("xbox_series", name, aspect);
+}
+
+// One button picture `h` tall at (x, cy); a key name in a box if the picture
+// is missing. Returns its width.
+float DrawGlyph(ImDrawList* dl, Glyphs& glyphs, Action a, const std::string& set, float x, float cy, float h,
+                const Metrics& m, bool draw, ImU32 fallback_color) {
+  float aspect = 1.0f;
+  if (auto* t = glyphs.Get(a, set, &aspect)) {
+    const float w = h * aspect;
+    if (draw) dl->AddImage(Tex(t), ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f));
+    return w;
+  }
+  static const char* const kNames[] = {"Up", "Down", "Left", "Right", "PgUp", "PgDn", "Enter",
+                                       "Esc", "Del", "R", "Q", "E", "P"};
+  const Fonts f = GetFonts();
+  const char* name = size_t(a) < std::size(kNames) ? kNames[size_t(a)] : "?";
+  const float fs = h * 0.5f;
+  const float w = TextSize(f.semibold, fs, name).x + 12 * m.s;
+  if (draw) {
+    dl->AddRect(ImVec2(x, cy - h * 0.42f), ImVec2(x + w, cy + h * 0.42f), WithAlpha(fallback_color, 0.5f), 4 * m.s);
+    dl->AddText(f.semibold, fs, ImVec2(x + 6 * m.s, cy - fs * 0.5f), fallback_color, name);
+  }
+  return w;
+}
+
+namespace {
+
+// A prompt's pictures: left/right and up/down are two keys on a keyboard.
+float DrawPromptGlyphs(ImDrawList* dl, Glyphs& glyphs, Action a, const std::string& set, float x, float cy, float h,
+                       const Metrics& m, bool draw) {
+  if (set == "keyboard" && (a == Action::kLeft || a == Action::kUp)) {
+    const Action second = a == Action::kLeft ? Action::kRight : Action::kDown;
+    const float w1 = DrawGlyph(dl, glyphs, a, set, x, cy, h, m, draw);
+    return w1 + 2 * m.s + DrawGlyph(dl, glyphs, second, set, x + w1 + 2 * m.s, cy, h, m, draw);
+  }
+  return DrawGlyph(dl, glyphs, a, set, x, cy, h, m, draw);
+}
+
+}  // namespace
+
+float PromptsWidth(ImDrawList* dl, Glyphs& glyphs, const std::string& set, const std::vector<Prompt>& prompts,
+                   const Metrics& m) {
+  const Fonts f = GetFonts();
+  const float s = m.s, gh = 28 * s, fs = 15 * s, gap = 8 * s, between = 26 * s;
+  float total = 0;
+  for (const Prompt& p : prompts)
+    total += DrawPromptGlyphs(dl, glyphs, p.action, set, 0, 0, gh, m, false) + gap + TextSize(f.text, fs, T(p.label)).x;
+  return total + between * float(prompts.empty() ? 0 : prompts.size() - 1);
+}
+
+Action DrawPrompts(ImDrawList* dl, Glyphs& glyphs, const std::string& set, const std::vector<Prompt>& prompts, float right,
+                   float center_y, const Metrics& m, bool clickable) {
+  const Fonts f = GetFonts();
+  const float s = m.s, gh = 28 * s, fs = 15 * s, gap = 8 * s, between = 26 * s;
+  std::vector<float> widths;
+  float total = 0;
+  for (const Prompt& p : prompts) {
+    const float w =
+        DrawPromptGlyphs(dl, glyphs, p.action, set, 0, 0, gh, m, false) + gap + TextSize(f.text, fs, T(p.label)).x;
+    widths.push_back(w);
+    total += w;
+  }
+  total += between * float(prompts.empty() ? 0 : prompts.size() - 1);
+  float x = right - total;
+  Action clicked = Action::kCount;
+  for (size_t i = 0; i < prompts.size(); ++i) {
+    const Prompt& p = prompts[i];
+    const ImVec2 a(x - 6 * s, center_y - gh * 0.5f - 4 * s), b(x + widths[i] + 6 * s, center_y + gh * 0.5f + 4 * s);
+    const bool hot = clickable && MouseIn(a, b);
+    const float gw = DrawPromptGlyphs(dl, glyphs, p.action, set, x, center_y, gh, m, true);
+    dl->AddText(f.text, fs, ImVec2(x + gw + gap, center_y - fs * 0.5f - 1 * s), hot ? color::kText : color::kTextDim,
+                T(p.label.c_str()));
+    if (hot && ImGui::IsMouseClicked(0)) clicked = p.action;
+    x += widths[i] + between;
+  }
+  return clicked;
+}
+
+int DrawTabs(ImDrawList* dl, Glyphs& glyphs, const std::string& set, const std::vector<std::string>& names, int current,
+             ImVec2 pos, const Metrics& m, bool clickable, float* underline_x, float* underline_w, float max_width) {
+  const Fonts f = GetFonts();
+  float fit = 1;
+  if (max_width > 0) {
+    float width = DrawGlyph(dl, glyphs, Action::kPrevTab, set, 0, 0, 24 * m.s, m, false) +
+                  DrawGlyph(dl, glyphs, Action::kNextTab, set, 0, 0, 24 * m.s, m, false) + 40 * m.s +
+                  float(names.empty() ? 0 : names.size() - 1) * 30 * m.s;
+    for (const auto& name : names) width += TrackedWidth(f.display, 15 * m.s, name, 1.6f * m.s);
+    fit = std::min(1.0f, max_width / width);
+  }
+  const float s = m.s * fit, fs = 15 * s, tracking = 1.6f * s, gap = 30 * s, gh = 24 * s;
+  Metrics tab_metrics = m;
+  tab_metrics.s = s;
+  float x = pos.x;
+  const float cy = pos.y;
+  x += DrawGlyph(dl, glyphs, Action::kPrevTab, set, x, cy, gh, tab_metrics, true) + 20 * s;
+  int clicked = -1;
+  for (size_t i = 0; i < names.size(); ++i) {
+    const float w = TrackedWidth(f.display, fs, names[i], tracking);
+    const ImVec2 a(x - gap * 0.5f, cy - 22 * s), b(x + w + gap * 0.5f, cy + 22 * s);
+    const bool hot = clickable && MouseIn(a, b);
+    const bool on = int(i) == current;
+    DrawTracked(dl, f.display, fs, ImVec2(x, cy - fs * 0.5f), on ? color::kText : hot ? color::kTextDim : color::kTextFaint,
+                names[i], tracking);
+    if (on) {
+      *underline_x = x;
+      *underline_w = w;
+    }
+    if (hot && ImGui::IsMouseClicked(0)) clicked = int(i);
+    x += w + gap;
+  }
+  DrawGlyph(dl, glyphs, Action::kNextTab, set, x - gap + 20 * s, cy, gh, tab_metrics, true);
+  return clicked;
+}
+
+// ------------------------------------------------------------------ items ---
+namespace {
+
+struct RowGeom {
+  float value_l = 0, value_r = 0;  // value text
+  float bar_l = 0, bar_r = 0;      // slider bar
+  float chevron_l = 0;             // left chevron's x
+};
+
+constexpr float kChevronW = 6, kChevronGap = 12;
+
+// The value a row shows, in the launcher's language.
+std::string ValueText(const Item& it) {
+  if (it.type == ItemType::kChoice && it.index >= 0 && it.index < int(it.options.size()))
+    return T(it.options[size_t(it.index)]);
+  return T(it.value_text);
+}
+
+std::string BoundedValueText(const Item& it, const Metrics& m, const Fonts& f) {
+  const std::string value = ValueText(it);
+  return it.value_max_width > 0 ? Ellipsize(f.semibold, 16 * m.s, value, it.value_max_width) : value;
+}
+
+RowGeom Geometry(const Item& it, float x0, float x1, const Metrics& m, const Fonts& f,
+                 Glyphs* glyphs = nullptr, const std::string& set = {}) {
+  const float s = m.s;
+  RowGeom g;
+  const float right = x1 - 18 * s;
+  g.value_r = right - (kChevronW + kChevronGap) * s;
+  if (it.type == ItemType::kChoice) {
+    g.value_l = g.value_r - TextSize(f.semibold, 16 * s, ValueText(it)).x;
+    g.chevron_l = g.value_l - (kChevronGap + kChevronW) * s;
+  } else if (it.type == ItemType::kSlider) {
+    g.value_l = g.value_r - 52 * s;
+    g.bar_r = g.value_l - 16 * s;
+    g.bar_l = g.bar_r - std::min(190 * s, (x1 - x0) * 0.32f);
+  } else {
+    // In line with the choices' values; a link's arrow sits where their right arrow does.
+    g.value_l = g.value_r - TextSize(f.semibold, 16 * s, BoundedValueText(it, m, f)).x;
+    if (glyphs && it.value_action != Action::kCount)
+      g.value_l -= DrawGlyph(nullptr, *glyphs, it.value_action, set, 0, 0, 24 * s, m, false) + 8 * s;
+  }
+  return g;
+}
+
+void DrawItem(ImDrawList* dl, const Item& it, float x0, float y0, float x1, float h, bool band, bool focused,
+              const Metrics& m, const Fonts& f, Glyphs* glyphs, const std::string& set) {
+  const float s = m.s;
+  if (it.type == ItemType::kText) {
+    const float fs = 16.5f * s;
+    dl->AddText(f.text, fs, ImVec2(x0 + 18 * s, y0 + (h - fs) * .5f), color::kTextDim,
+                Ellipsize(f.text, fs, it.literal_label ? it.label : T(it.label), std::max(1.0f, x1 - x0 - 36 * s)).c_str());
+    return;
+  }
+  if (it.type == ItemType::kSection) {
+    const float fs = 13 * s, ty = y0 + h - 16 * s - fs;
+    const std::string caption = text::Upper(T(it.label));
+    const float w = TrackedWidth(f.display, fs, caption, 2.2f * s);
+    DrawTracked(dl, f.display, fs, ImVec2(x0 + 2 * s, ty), it.value_color ? it.value_color : color::kAccent, caption, 2.2f * s);
+    dl->AddLine(ImVec2(x0 + w + 16 * s, std::round(ty + fs * 0.55f)), ImVec2(x1, std::round(ty + fs * 0.55f)),
+                color::kHairline, 1.0f);
+    return;
+  }
+  // A greyed row under the focus bar: dark enough to read on the bone bar, still lighter than a live row (task 261).
+  const ImU32 text = band ? (it.disabled ? color::kOnFocusGreyed : color::kOnFocus)
+                          : (it.disabled ? color::kTextFaint : color::kText);
+  const ImU32 dim = band ? (it.focus_subtitle_color ? it.focus_subtitle_color :
+                           it.disabled ? color::kOnFocusGreyed : color::kOnFocusDim)
+                         : (it.disabled ? color::kTextFaint : color::kTextDim);
+  const float cy = y0 + h * 0.5f;
+  float lx = x0 + 18 * s;
+  if (it.icon) {
+    // Small icons sit centred in a column of their own, so the labels line up.
+    const float ih = it.tall ? h - 22 * s : 26 * s, iw = ih * it.icon_aspect;
+    const float slot = it.tall ? iw : std::max(iw, ih * 1.5f);
+    const float ix = lx + (slot - iw) * 0.5f;
+    dl->AddImage(Tex(it.icon), ImVec2(ix, cy - ih * 0.5f), ImVec2(ix + iw, cy + ih * 0.5f), ImVec2(0, 0),
+                 ImVec2(1, 1), it.icon_dim ? IM_COL32(120, 124, 132, 190) : IM_COL32_WHITE);
+    lx += slot + (it.tall ? 16 : 12) * s;
+  }
+  const RowGeom g = Geometry(it, x0, x1, m, f, glyphs, set);
+  const float label_room = (it.type == ItemType::kSlider ? g.bar_l : g.value_l) - 24 * s - lx;
+  if (it.tall) {
+    dl->AddText(f.semibold, 16.5f * s, ImVec2(lx, cy - 20 * s), text,
+                Ellipsize(f.semibold, 16.5f * s, it.literal_label ? it.label : T(it.label), label_room).c_str());
+    const std::string raw_sub = it.subtitle.empty() ? it.description : it.subtitle;
+    const std::string sub = it.literal_subtitle ? raw_sub : T(raw_sub);
+    dl->AddText(f.text, 14.5f * s, ImVec2(lx, cy + 2 * s), dim, Ellipsize(f.text, 14.5f * s, sub, label_room).c_str());
+  } else {
+    dl->AddText(f.text, 17 * s, ImVec2(lx, cy - 17 * s * 0.5f - 1 * s), text,
+                Ellipsize(f.text, 17 * s, it.literal_label ? it.label : T(it.label), label_room).c_str());
+  }
+
+  const float vs = 16 * s;
+  const ImU32 value_col = band ? text : it.disabled ? color::kTextFaint : it.value_color ? it.value_color : color::kTextDim;
+  switch (it.type) {
+    case ItemType::kChoice: {
+      const bool listed = it.index >= 0 && it.index < int(it.options.size());
+      const std::string v = ValueText(it);
+      const int n = int(it.options.size());
+      const bool pips = n >= 2 && n <= 7 && !it.disabled;
+      const float ty = cy - vs * 0.5f - (pips ? 4 * s : 1 * s);
+      dl->AddText(f.semibold, vs, ImVec2(g.value_l, ty), value_col, v.c_str());
+      if (pips) {
+        const float pw = 9 * s, pg = 3 * s, total = pw * n + pg * (n - 1);
+        float px = (g.value_l + g.value_r) * 0.5f - total * 0.5f;
+        px = std::min(px, g.value_r - total);
+        const float py = ty + vs + 5 * s;
+        for (int i = 0; i < n; ++i, px += pw + pg)
+          dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + 2 * s),
+                            i == it.index ? value_col : WithAlpha(value_col, 0.28f));
+      }
+      if (focused && band && !it.disabled) {
+        const ImU32 c = color::kOnFocus;
+        const float aw = kChevronW * s, ah = 10 * s;
+        ArrowLeft(dl, g.chevron_l, ty + vs * 0.5f + 1 * s, aw, ah,
+                  it.index <= 0 && listed ? WithAlpha(c, 0.25f) : c);
+        ArrowRight(dl, g.value_r + kChevronGap * s, ty + vs * 0.5f + 1 * s, aw, ah,
+                   it.index >= n - 1 && listed ? WithAlpha(c, 0.25f) : c);
+      }
+      break;
+    }
+    case ItemType::kSlider: {
+      const float t = it.hi > it.lo ? std::clamp((it.value - it.lo) / (it.hi - it.lo), 0.0f, 1.0f) : 0.0f;
+      const float by = std::round(cy);
+      const ImU32 track = band ? WithAlpha(color::kOnFocus, 0.18f) : WithAlpha(color::kText, 0.16f);
+      const ImU32 fill = band ? color::kOnFocus : it.disabled ? color::kTextFaint : color::kTextDim;
+      dl->AddRectFilled(ImVec2(g.bar_l, by - 1 * s), ImVec2(g.bar_r, by + 1 * s), track);
+      const float kx = g.bar_l + (g.bar_r - g.bar_l) * t;
+      dl->AddRectFilled(ImVec2(g.bar_l, by - 1 * s), ImVec2(kx, by + 1 * s), fill);
+      dl->AddRectFilled(ImVec2(kx - 2 * s, by - 8 * s), ImVec2(kx + 2 * s, by + 8 * s), fill);
+      const float tw = TextSize(f.semibold, vs, it.value_text).x;
+      dl->AddText(f.semibold, vs, ImVec2(g.value_r - tw, cy - vs * 0.5f - 1 * s), value_col, it.value_text.c_str());
+      break;
+    }
+    case ItemType::kLink:
+      ArrowRight(dl, x1 - 18 * s - kChevronW * s, cy, kChevronW * s, 10 * s, band ? text : dim);
+      [[fallthrough]];
+    case ItemType::kAction:
+    case ItemType::kInfo:
+      if (!it.value_text.empty()) {
+        float vx = g.value_l;
+        if (glyphs && it.value_action != Action::kCount)
+          vx += DrawGlyph(dl, *glyphs, it.value_action, set, vx, cy, 24 * s, m,
+                          focused && !it.disabled, value_col) + 8 * s;
+        dl->AddText(f.semibold, vs, ImVec2(vx, cy - vs * 0.5f - 1 * s), value_col,
+                    BoundedValueText(it, m, f).c_str());
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+}  // namespace
+
+const Item* DrawList(ImDrawList* dl, std::vector<Item>& items, ListState& st, ImVec2 p0, ImVec2 p1,
+                     const Metrics& m, Input& in, bool active, Glyphs* glyphs, const std::string& prompt_set) {
+  const float s = m.s;
+  const Fonts f = GetFonts();
+  const float view_h = p1.y - p0.y;
+  const int count = int(items.size());
+
+  std::vector<float> top(items.size()), height(items.size());
+  float total = 0;
+  for (int i = 0; i < count; ++i) {
+    const Item& it = items[size_t(i)];
+    const float h = it.type == ItemType::kSection ? (i == 0 ? m.section_h - 16 * s : m.section_h)
+                    : it.tall                     ? m.tall_h
+                                                  : m.row_h;
+    top[size_t(i)] = total;
+    height[size_t(i)] = h;
+    total += h;
+  }
+  auto focusable = [&](int i) { return i >= 0 && i < count && items[size_t(i)].type != ItemType::kSection &&
+      items[size_t(i)].type != ItemType::kText; };
+  if (!st.focus_label.empty() && (!focusable(st.focus) || items[size_t(st.focus)].label != st.focus_label)) {
+    for (int i = 0; i < count; ++i) {
+      if (focusable(i) && items[size_t(i)].label == st.focus_label) {
+        st.focus = i;
+        break;
+      }
+    }
+  }
+  if (!focusable(st.focus)) {
+    int found = -1;
+    for (int i = std::max(0, st.focus); i < count && found < 0; ++i)
+      if (focusable(i)) found = i;
+    for (int i = std::min(st.focus, count - 1); i >= 0 && found < 0; --i)
+      if (focusable(i)) found = i;
+    st.focus = found;
+    st.band_y = -1;
+  }
+  int first_focusable = -1;
+  for (int i = 0; i < count && first_focusable < 0; ++i)
+    if (focusable(i)) first_focusable = i;
+
+  // Changes go through these, with their sounds: a two-way choice sounds on
+  // or off, a slider's pitch follows its value.
+  const int focus_before = st.focus;
+  // (The sound after the change, so the sound settings are heard as set.)
+  auto choose = [](Item& it, int to) {
+    if (to == it.index || !it.on_choice) return;
+    const bool two_way = it.options.size() == 2;
+    it.on_choice(to);
+    Cue(two_way ? (to == 1 ? Sound::kOn : Sound::kOff) : Sound::kChange);
+  };
+  auto set_value = [](Item& it, float v) {
+    if (v == it.value || !it.on_value) return;
+    const float at = (v - it.lo) / std::max(1e-6f, it.hi - it.lo);
+    it.on_value(v);
+    Cue(Sound::kSlide, at);
+  };
+  auto activate = [](Item& it) {
+    Cue(Sound::kSelect);
+    it.on_activate();
+  };
+
+  // Focus moved since the last frame by the page itself (e.g. Extras opening Graphics at its row): bring it into view.
+  bool keep_visible = st.focus != st.shown_focus;
+  const ImGuiIO& io = ImGui::GetIO();
+  if (active && st.focus >= 0) {
+    auto step = [&](int dir) {
+      for (int i = st.focus + dir; i >= 0 && i < count; i += dir) {
+        if (focusable(i)) {
+          st.focus = i;
+          break;
+        }
+      }
+      keep_visible = true;
+    };
+    if (in.Pressed(Action::kUp)) step(-1);
+    if (in.Pressed(Action::kDown)) step(+1);
+    if (in.Pressed(Action::kPageUp) || in.Pressed(Action::kPageDown)) {
+      const int dir = in.Pressed(Action::kPageDown) ? 1 : -1;
+      const float goal = top[size_t(st.focus)] + dir * (view_h - m.row_h * 1.5f);
+      for (int i = st.focus + dir; i >= 0 && i < count; i += dir) {
+        if (!focusable(i)) continue;
+        st.focus = i;
+        if (dir < 0 ? top[size_t(i)] <= goal : top[size_t(i)] >= goal) break;
+      }
+      keep_visible = true;
+    }
+    for (Action a : {Action::kUp, Action::kDown, Action::kPageUp, Action::kPageDown}) in.Consume(a);
+
+    Item& it = items[size_t(st.focus)];
+    const bool can_change = !it.disabled;
+    if (in.Pressed(Action::kLeft) || in.Pressed(Action::kRight)) {
+      const int dir = in.Pressed(Action::kRight) ? 1 : -1;
+      const int n = int(it.options.size());
+      if (it.type == ItemType::kChoice && can_change && n > 0) {
+        choose(it, it.index < 0 ? (dir > 0 ? 0 : n - 1) : std::clamp(it.index + dir, 0, n - 1));
+      } else if (it.type == ItemType::kSlider && can_change) {
+        set_value(it, StepSlider(it.value, it.lo, it.hi, it.step, dir));
+      } else if (it.disabled && (it.type == ItemType::kChoice || it.type == ItemType::kSlider)) {
+        Cue(Sound::kDeny);
+      }
+      in.Consume(Action::kLeft);
+      in.Consume(Action::kRight);
+    }
+    if (in.Pressed(Action::kAccept)) {
+      if (it.type == ItemType::kChoice && !it.options.empty()) {
+        if (can_change) choose(it, (it.index + 1) % int(it.options.size()));
+        else Cue(Sound::kDeny);
+      } else if (it.on_activate) {
+        if (can_change) activate(it);
+        else Cue(Sound::kDeny);
+      }
+      in.Consume(Action::kAccept);
+    }
+    if (in.Pressed(Action::kDefault) && it.on_default) {
+      if (can_change) {
+        Cue(Sound::kChange);
+        it.on_default();
+      } else {
+        Cue(Sound::kDeny);
+      }
+      in.Consume(Action::kDefault);
+    }
+  }
+
+  // The mouse: hovering focuses (once it moves), clicks act, the wheel scrolls.
+  if (st.dragging >= 0 && (!ImGui::IsMouseDown(0) || !focusable(st.dragging))) st.dragging = -1;
+  const bool hover_list = active && MouseIn(p0, p1);
+  if (hover_list && io.MouseWheel != 0) st.scroll_target -= io.MouseWheel * m.row_h * 2.5f;
+  if (hover_list && st.dragging < 0) {
+    const float my = io.MousePos.y - p0.y + st.scroll;
+    int hovered = -1;
+    for (int i = 0; i < count; ++i)
+      if (my >= top[size_t(i)] && my < top[size_t(i)] + height[size_t(i)]) hovered = i;
+    if (focusable(hovered) && (in.mouse_moved() || ImGui::IsMouseClicked(0))) st.focus = hovered;
+    if (focusable(hovered) && ImGui::IsMouseClicked(0)) {
+      Item& it = items[size_t(hovered)];
+      const RowGeom g = Geometry(it, p0.x, p1.x, m, f, glyphs, prompt_set);
+      const float mx = io.MousePos.x;
+      if (!it.disabled) {
+        if (it.type == ItemType::kChoice && !it.options.empty()) {
+          const int n = int(it.options.size());
+          int to = (it.index + 1) % n;
+          if (mx < g.value_l - 4 * s && mx > g.chevron_l - 16 * s) to = std::max(0, it.index - 1);
+          if (it.index < 0) to = 0;
+          choose(it, to);
+        } else if (it.type == ItemType::kSlider) {
+          if (mx > g.bar_l - 12 * s && mx < g.bar_r + 12 * s) st.dragging = hovered;
+        } else if (it.on_activate) {
+          activate(it);
+        }
+      } else if (it.type != ItemType::kInfo) {
+        Cue(Sound::kDeny);
+      }
+    }
+  }
+  if (st.dragging >= 0) {
+    Item& it = items[size_t(st.dragging)];
+    const RowGeom g = Geometry(it, p0.x, p1.x, m, f, glyphs, prompt_set);
+    const float t = std::clamp((io.MousePos.x - g.bar_l) / std::max(1.0f, g.bar_r - g.bar_l), 0.0f, 1.0f);
+    float v = it.lo + (it.hi - it.lo) * t;
+    if (it.step > 0) v = it.lo + std::round((v - it.lo) / it.step) * it.step;
+    set_value(it, std::clamp(v, it.lo, it.hi));
+  }
+  if (active && st.focus != focus_before && st.focus >= 0 && focus_before >= 0) Cue(Sound::kMove);
+
+  // Scrolling: keep the focused row (and its section's caption) in view.
+  const float max_scroll = std::max(0.0f, total - view_h);
+  if (keep_visible && st.focus >= 0) {
+    const size_t i = size_t(st.focus);
+    float a = top[i];
+    if (st.focus == first_focusable) a = 0;
+    else if (i > 0 && items[i - 1].type == ItemType::kSection) a = top[i - 1];
+    const float b = top[i] + height[i];
+    const float margin = m.row_h * 0.6f;
+    if (a - margin < st.scroll_target) st.scroll_target = a - margin;
+    if (b + margin > st.scroll_target + view_h) st.scroll_target = b + margin - view_h;
+  }
+  st.scroll_target = std::clamp(st.scroll_target, 0.0f, max_scroll);
+  st.scroll = std::clamp(Approach(st.scroll, st.scroll_target, 20.0f), 0.0f, max_scroll);
+  st.shown_focus = st.focus;
+
+  // The focus band glides between rows.
+  if (st.focus >= 0) {
+    const float ty = top[size_t(st.focus)], th = height[size_t(st.focus)];
+    if (st.band_y < 0) {
+      st.band_y = ty;
+      st.band_h = th;
+    } else {
+      st.band_y = Approach(st.band_y, ty, 28.0f);
+      st.band_h = Approach(st.band_h, th, 28.0f);
+    }
+  }
+
+  dl->PushClipRect(p0, p1, true);
+  auto visible = [&](int i, float y) { return y + height[size_t(i)] >= p0.y && y <= p1.y; };
+  for (int i = 0; i < count; ++i) {
+    const float y = p0.y + top[size_t(i)] - st.scroll;
+    if (!visible(i, y)) continue;
+    DrawItem(dl, items[size_t(i)], p0.x, y, p1.x, height[size_t(i)], false, false, m, f, glyphs, prompt_set);
+    // A hairline between neighbouring rows.
+    if (i + 1 < count && items[size_t(i)].type != ItemType::kSection &&
+        items[size_t(i) + 1].type != ItemType::kSection) {
+      const float ly = std::round(y + height[size_t(i)]) - 0.5f;
+      dl->AddLine(ImVec2(p0.x, ly), ImVec2(p1.x, ly), WithAlpha(color::kText, 0.05f), 1.0f);
+    }
+  }
+  if (st.focus >= 0 && !st.hide_focus) {
+    const ImVec2 b0(p0.x, std::round(p0.y + st.band_y - st.scroll));
+    const ImVec2 b1(p1.x, std::round(b0.y + st.band_h));
+    dl->AddRectFilled(b0, b1, active ? color::kFocus : WithAlpha(color::kFocus, 0.8f));
+    dl->PushClipRect(b0, b1, true);
+    for (int i = 0; i < count; ++i) {
+      const float y = p0.y + top[size_t(i)] - st.scroll;
+      if (y + height[size_t(i)] < b0.y || y > b1.y) continue;
+      DrawItem(dl, items[size_t(i)], p0.x, y, p1.x, height[size_t(i)], true, i == st.focus, m, f, glyphs, prompt_set);
+    }
+    dl->PopClipRect();
+  }
+  dl->PopClipRect();
+
+  // A thin scroll bar beside the list when it doesn't fit.
+  if (max_scroll > 0) {
+    const float x = p1.x + 14 * s;
+    dl->AddRectFilled(ImVec2(x, p0.y), ImVec2(x + 2 * s, p1.y), WithAlpha(color::kText, 0.03f));
+    const float th = std::max(24 * s, view_h * view_h / total);
+    const float ty = p0.y + (view_h - th) * (st.scroll / max_scroll);
+    dl->AddRectFilled(ImVec2(x, ty), ImVec2(x + 2 * s, ty + th), WithAlpha(color::kText, 0.22f));
+  }
+  st.focus_label = st.focus >= 0 ? items[size_t(st.focus)].label : std::string();
+  return st.focus >= 0 ? &items[size_t(st.focus)] : nullptr;
+}
+
+namespace {
+
+// The option notes a row shows (settings_help.h): for a choice, those of the options it offers, in the help's
+// order, each under the name the row gives it ("Strong (recommended)"); for a slider or an action, every note.
+// `current` is the note of the option chosen now (or -1).
+struct ShownNote {
+  std::string name;  // English (or already translated), translated as drawn
+  const char* note;
+};
+std::vector<ShownNote> ShownNotes(const Item& item, int* current) {
+  std::vector<ShownNote> out;
+  *current = -1;
+  if (!item.help) return out;
+  const std::string chosen =
+      item.type == ItemType::kChoice && item.index >= 0 && item.index < int(item.options.size())
+          ? item.options[size_t(item.index)]
+          : std::string();
+  for (const help::OptionNote& n : item.help->options) {
+    if (!n.option || !n.note) continue;
+    const std::string_view key(n.option);
+    std::string name = item.type == ItemType::kChoice ? std::string() : std::string(n.option);
+    for (const std::string& o : item.options)
+      if (name.empty() && std::string_view(o).substr(0, key.size()) == key) name = o;
+    if (name.empty()) continue;
+    if (!chosen.empty() && std::string_view(chosen).substr(0, key.size()) == key && *current < 0)
+      *current = int(out.size());
+    out.push_back({std::move(name), n.note});
+  }
+  return out;
+}
+
+// One impact label: a rounded box with, for a cost, a three-step meter before its text.
+float Chip(ImDrawList* dl, const std::string& text, int level, ImU32 text_color, ImVec2 at, float k, const Metrics& m,
+           bool draw) {
+  const Fonts f = GetFonts();
+  const float s = m.s, fs = 13 * s * k, h = 22 * s * k, pad = 8 * s * k;
+  const float meter = level >= 0 ? 16 * s * k : 0.0f;
+  const float w = pad * 2 + meter + TextSize(f.text, fs, text).x;
+  if (draw) {
+    dl->AddRectFilled(at, ImVec2(at.x + w, at.y + h), WithAlpha(color::kText, 0.05f), 4 * s);
+    dl->AddRect(at, ImVec2(at.x + w, at.y + h), color::kHairline, 4 * s);
+    if (level >= 0) {
+      const ImU32 on = level <= 1 ? color::kGood : level == 2 ? color::kWarn : color::kBad;
+      for (int i = 0; i < 3; ++i) {
+        const float bx = at.x + pad + float(i) * 4.5f * s * k, bh = (5.0f + 3.0f * float(i)) * s * k;
+        dl->AddRectFilled(ImVec2(bx, at.y + h * 0.5f + 5.5f * s * k - bh), ImVec2(bx + 3 * s * k, at.y + h * 0.5f + 5.5f * s * k),
+                          i < level ? on : WithAlpha(color::kText, 0.16f));
+      }
+    }
+    dl->AddText(f.text, fs, ImVec2(at.x + pad + meter, at.y + (h - fs) * 0.5f - 1 * s), text_color, text.c_str());
+  }
+  return w;
+}
+
+// Lays the panel out from p0 at width w and, when `dl` is set, draws it. Returns its height. `k` scales the
+// body text (a long German panel shrinks a little to fit); without `how` the help's second paragraph is left out.
+float LayoutDescription(ImDrawList* dl, const Item& item, ImVec2 p0, float w, const Metrics& m, float k, bool how) {
+  const Fonts f = GetFonts();
+  const bool draw = dl != nullptr;
+  const float s = m.s;
+  float y = p0.y;
+  if (item.icon && item.tall) {
+    const float ih = 84 * s;
+    if (draw)
+      dl->AddImage(Tex(item.icon), ImVec2(p0.x, y), ImVec2(p0.x + ih * item.icon_aspect, y + ih), ImVec2(0, 0),
+                   ImVec2(1, 1), item.icon_dim ? IM_COL32(120, 124, 132, 200) : IM_COL32_WHITE);
+    y += ih + 20 * s;
+  }
+  auto para = [&](ImFont* font, float size, ImU32 col, const std::string& text, float x, float width, float gap) {
+    if (draw) dl->AddText(font, size, ImVec2(x, y), col, text.c_str(), nullptr, width);
+    y += TextSize(font, size, text, width).y + gap;
+  };
+  para(f.display, 25 * s, color::kText, T(item.label), p0.x, w, 12 * s);
+  const float bs = 15.5f * s * k;
+  const bool structured = item.help != nullptr;
+  if (!item.description.empty())
+    para(f.text, bs, structured ? color::kText : color::kTextDim, T(item.description), p0.x, w, 10 * s * k);
+  if (structured && how && item.help->how) para(f.text, bs, color::kTextDim, T(item.help->how), p0.x, w, 10 * s * k);
+  if (structured) y += 2 * s * k;
+  for (const std::string& english : item.facts) {
+    if (english.empty()) continue;
+    const float indent = 16 * s;
+    if (draw)
+      dl->AddRectFilled(ImVec2(p0.x + 1 * s, y + bs * 0.5f - 1.5f * s), ImVec2(p0.x + 5 * s, y + bs * 0.5f + 2.5f * s),
+                        color::kAccent);
+    para(f.text, bs, color::kText, T(english), p0.x + indent, w - indent, 8 * s * k);
+  }
+  if (!item.facts.empty()) y += 6 * s * k;
+  if (item.disabled && !item.disabled_note.empty()) para(f.text, bs, color::kWarn, T(item.disabled_note), p0.x, w, 12 * s * k);
+
+  // Each option: its name in a column, then its note.
+  int current = -1;
+  const std::vector<ShownNote> notes = ShownNotes(item, &current);
+  if (!notes.empty()) {
+    const float os = 14 * s * k;
+    float col = 0;
+    for (const ShownNote& n : notes) col = std::max(col, TextSize(f.semibold, os, T(n.name)).x);
+    col = std::min(col + 14 * s * k, std::round(w * 0.36f));
+    for (size_t i = 0; i < notes.size(); ++i) {
+      const bool on = int(i) == current;
+      const std::string name = T(notes[i].name), note = T(notes[i].note);
+      const float name_h = TextSize(f.semibold, os, name, col - 10 * s * k).y;
+      const float note_h = TextSize(f.text, os, note, w - col).y;
+      if (draw) {
+        if (on) dl->AddRectFilled(ImVec2(p0.x - 10 * s, y + 2 * s), ImVec2(p0.x - 7 * s, y + os + 2 * s), color::kAccent);
+        dl->AddText(f.semibold, os, ImVec2(p0.x, y), on ? color::kAccent : color::kText, name.c_str(), nullptr,
+                    col - 10 * s * k);
+        dl->AddText(f.text, os, ImVec2(p0.x + col, y), on ? color::kText : color::kTextDim, note.c_str(), nullptr,
+                    w - col);
+      }
+      y += std::max(name_h, note_h) + 6 * s * k;
+    }
+    y += 6 * s * k;
+  }
+
+  // The impact labels, wrapping onto a second line when they don't fit.
+  struct Label {
+    std::string text;
+    int level;
+    ImU32 color;
+  };
+  std::vector<Label> labels;
+  if (structured) {
+    if (const char* p = help::PerfLabel(item.help->perf)) labels.push_back({T(p), help::Level(item.help->perf), color::kTextDim});
+    if (const char* v = help::VramLabel(item.help->vram)) labels.push_back({T(v), help::Level(item.help->vram), color::kTextDim});
+  }
+  if (item.applies)
+    labels.push_back({T(item.applies), -1, std::string_view(item.applies) == help::kNotWhilePlaying ? color::kWarn : color::kTextDim});
+  if (!labels.empty()) {
+    const float h = 22 * s * k, gap = 6 * s;
+    float x = p0.x;
+    for (const Label& l : labels) {
+      const float lw = Chip(nullptr, l.text, l.level, l.color, ImVec2(x, y), k, m, false);
+      if (x > p0.x && x + lw > p0.x + w) {
+        x = p0.x;
+        y += h + gap;
+      }
+      x += Chip(dl, l.text, l.level, l.color, ImVec2(x, y), k, m, draw) + gap;
+    }
+    y += h + 12 * s * k;
+  }
+  if (!item.default_text.empty()) para(f.text, 14 * s * k, color::kTextFaint, text::F("Default: {0}", {T(item.default_text)}), p0.x, w, 0);
+  return y - p0.y;
+}
+
+// The largest layout that fits between p0 and p1: 0 at full size, 1 or 2 with smaller text, 3 without the help's
+// second paragraph, 4 when even that is too tall (drawn anyway).
+int FitDescription(const Item& item, ImVec2 p0, ImVec2 p1, const Metrics& m, float* k, bool* how) {
+  static constexpr float kScales[] = {1.0f, 0.93f, 0.87f};
+  const float w = p1.x - p0.x, avail = p1.y - p0.y;
+  for (int i = 0; i < 3; ++i)
+    if (LayoutDescription(nullptr, item, p0, w, m, kScales[i], true) <= avail) {
+      *k = kScales[i], *how = true;
+      return i;
+    }
+  *k = kScales[2], *how = false;
+  return LayoutDescription(nullptr, item, p0, w, m, *k, false) <= avail ? 3 : 4;
+}
+
+}  // namespace
+
+void DrawDescription(ImDrawList* dl, const Item* item, ImVec2 p0, ImVec2 p1, const Metrics& m) {
+  if (!item || item->type == ItemType::kSection) return;
+  float k = 1.0f;
+  bool how = true;
+  FitDescription(*item, p0, p1, m, &k, &how);
+  LayoutDescription(dl, *item, p0, p1.x - p0.x, m, k, how);
+}
+
+int DescriptionFit(const Item* item, ImVec2 p0, ImVec2 p1, const Metrics& m) {
+  if (!item || item->type == ItemType::kSection) return 0;
+  float k = 1.0f;
+  bool how = true;
+  return FitDescription(*item, p0, p1, m, &k, &how);
+}
+
+// ----------------------------------------------------------------- pop-up ---
+namespace {
+
+std::string PlainText(std::string s) {
+  for (const char* mark : {"**", "`"})
+    for (size_t at; (at = s.find(mark)) != std::string::npos;) s.erase(at, std::strlen(mark));
+  for (size_t open; (open = s.find('[')) != std::string::npos;) {
+    const size_t mid = s.find("](", open), close = mid == std::string::npos ? mid : s.find(')', mid);
+    if (close == std::string::npos) break;
+    s = s.substr(0, open) + s.substr(open + 1, mid - open - 1) + s.substr(close + 1);
+  }
+  return s;
+}
+
+}  // namespace
+
+float DrawRichText(ImDrawList* dl, const std::string& text, ImVec2 pos, float width, const Metrics& m, bool draw) {
+  const Fonts f = GetFonts();
+  const float s = m.s, bs = 15 * s;
+  float y = pos.y;
+  bool first = true;
+  std::stringstream in(text);
+  for (std::string line; std::getline(in, line);) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) {
+      y += 6 * s;
+    } else if (line.rfind("## ", 0) == 0) {
+      if (!first) {
+        y += 18 * s;
+        if (draw) dl->AddLine(ImVec2(pos.x, y), ImVec2(pos.x + width, y), color::kHairline, 1.0f);
+        y += 20 * s;
+      }
+      const std::string t = PlainText(line.substr(3));
+      // "v1.9.2|9 October 2026": the version, then the date dimmed.
+      const size_t bar = t.find('|');
+      const std::string head = t.substr(0, bar), date = bar == std::string::npos ? "" : t.substr(bar + 1);
+      const float hs = 24 * s;
+      if (draw) {
+        dl->AddText(f.display, hs, ImVec2(pos.x, y), color::kText, head.c_str());
+        if (!date.empty())
+          dl->AddText(f.text, 14 * s, ImVec2(pos.x + TextSize(f.display, hs, head).x + 14 * s, y + hs - 17 * s),
+                      color::kTextFaint, date.c_str());
+      }
+      y += hs + 6 * s;
+    } else if (line.rfind("### ", 0) == 0) {
+      y += 8 * s;
+      const std::string t = PlainText(line.substr(4));
+      if (draw) dl->AddText(f.semibold, 16.5f * s, ImVec2(pos.x, y), color::kText, t.c_str(), nullptr, width);
+      y += TextSize(f.semibold, 16.5f * s, t, width).y + 6 * s;
+    } else {
+      size_t indent = 0;
+      while (indent < line.size() && line[indent] == ' ') ++indent;
+      const bool bullet = line.compare(indent, 2, "- ") == 0;
+      const std::string t = PlainText(line.substr(indent + (bullet ? 2 : 0)));
+      const float x = pos.x + float(indent / 2) * 18 * s + (bullet ? 16 * s : 0);
+      if (draw) {
+        if (bullet)
+          dl->AddRectFilled(ImVec2(x - 12 * s, y + bs * 0.5f - 1 * s), ImVec2(x - 8 * s, y + bs * 0.5f + 3 * s),
+                            WithAlpha(color::kTextDim, 0.8f));
+        dl->AddText(f.text, bs, ImVec2(x, y), color::kTextDim, t.c_str(), nullptr, pos.x + width - x);
+      }
+      y += TextSize(f.text, bs, t, pos.x + width - x).y + 5 * s;
+    }
+    first = false;
+  }
+  return y - pos.y;
+}
+
+bool DrawModal(ImDrawList* dl, Modal& modal, ImVec2 view0, ImVec2 view1, const Metrics& m, Input& in) {
+  if (!modal.open) return false;
+  const Fonts f = GetFonts();
+  // In the launcher's language.
+  const std::string title = T(modal.title), message = T(modal.body);
+  std::vector<std::string> buttons;
+  for (const std::string& b : modal.buttons) buttons.push_back(T(b));
+  const float s = m.s;
+  const int frame = ImGui::GetFrameCount();
+  if (modal.shown_frame < 0) modal.shown_frame = frame;
+  const bool take_input = frame > modal.shown_frame;
+
+  dl->AddRectFilled(view0, view1, IM_COL32(0, 0, 0, 165));
+  const float view_w = view1.x - view0.x, view_h = view1.y - view0.y;
+  const float w = std::min(modal.width * s, view_w - 64 * s);
+  const float pad = 32 * s, inner = w - pad * 2;
+
+  // Measure.
+  const float ts = 26 * s, bs = 16 * s, bh = 44 * s;
+  float h = pad + TextSize(f.display, ts, title, inner).y + 16 * s;
+  if (!message.empty()) h += TextSize(f.text, bs, message, inner).y + 14 * s;
+  const std::string live = modal.live ? modal.live() : std::string();
+  if (!live.empty()) h += TextSize(f.text, 15 * s, live, inner).y + 12 * s;
+  if (modal.progress) h += 22 * s;
+  float reader_h = 0, reader_total = 0;
+  if (!modal.reader.empty()) {
+    reader_total = DrawRichText(dl, modal.reader, ImVec2(0, 0), inner - 16 * s, m, false);
+    const float room = view_h - 96 * s - h - (modal.buttons.empty() ? 0 : bh + 24 * s) - pad;
+    reader_h = std::max(80 * s, std::min(reader_total, room));
+    h += reader_h + 16 * s;
+  }
+  std::vector<float> bw;
+  float row_w = 0;
+  for (const std::string& b : buttons) {
+    bw.push_back(std::max(132 * s, TextSize(f.semibold, 16 * s, b).x + 48 * s));
+    row_w += bw.back();
+  }
+  row_w += 10 * s * float(bw.empty() ? 0 : bw.size() - 1);
+  const bool stacked = row_w > inner;
+  if (!modal.buttons.empty()) h += 10 * s + (stacked ? (bh + 8 * s) * float(bw.size()) - 8 * s : bh);
+  h += pad;
+
+  const ImVec2 p0(std::round(view0.x + (view_w - w) * 0.5f), std::round(view0.y + (view_h - h) * 0.5f));
+  const ImVec2 p1(p0.x + w, p0.y + h);
+  dl->AddRectFilled(p0, p1, color::kPanel);
+  dl->AddRect(p0, p1, WithAlpha(color::kText, 0.09f));
+  dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + 2 * s), color::kAccent);
+
+  float y = p0.y + pad;
+  const float x = p0.x + pad;
+  dl->AddText(f.display, ts, ImVec2(x, y), color::kText, title.c_str(), nullptr, inner);
+  y += TextSize(f.display, ts, title, inner).y + 16 * s;
+  if (!message.empty()) {
+    dl->AddText(f.text, bs, ImVec2(x, y), color::kTextDim, message.c_str(), nullptr, inner);
+    y += TextSize(f.text, bs, message, inner).y + 14 * s;
+  }
+  if (!live.empty()) {
+    dl->AddText(f.text, 15 * s, ImVec2(x, y), color::kText, live.c_str(), nullptr, inner);
+    y += TextSize(f.text, 15 * s, live, inner).y + 12 * s;
+  }
+  if (modal.progress) {
+    const float p = modal.progress();
+    const float by = y + 6 * s;
+    dl->AddRectFilled(ImVec2(x, by), ImVec2(x + inner, by + 3 * s), WithAlpha(color::kText, 0.12f));
+    if (p >= 0) {
+      dl->AddRectFilled(ImVec2(x, by), ImVec2(x + inner * std::clamp(p, 0.0f, 1.0f), by + 3 * s), color::kAccent);
+    } else {  // a segment sweeping across
+      const float t = float(std::fmod(ImGui::GetTime() * 0.7, 1.0));
+      const float a = x + inner * std::max(0.0f, t * 1.3f - 0.3f), b = x + inner * std::min(1.0f, t * 1.3f);
+      dl->AddRectFilled(ImVec2(a, by), ImVec2(b, by + 3 * s), color::kAccent);
+    }
+    y += 22 * s;
+  }
+  if (!modal.reader.empty()) {
+    const ImVec2 r0(x, y), r1(x + inner, y + reader_h);
+    const float max_scroll = std::max(0.0f, reader_total - reader_h);
+    if (take_input) {
+      const float line = 48 * s;
+      if (in.Pressed(Action::kUp)) modal.reader_scroll -= line;
+      if (in.Pressed(Action::kDown)) modal.reader_scroll += line;
+      if (in.Pressed(Action::kPageUp)) modal.reader_scroll -= reader_h * 0.85f;
+      if (in.Pressed(Action::kPageDown)) modal.reader_scroll += reader_h * 0.85f;
+      if (MouseIn(r0, r1)) modal.reader_scroll -= ImGui::GetIO().MouseWheel * line * 1.5f;
+    }
+    modal.reader_scroll = std::clamp(modal.reader_scroll, 0.0f, max_scroll);
+    dl->PushClipRect(r0, r1, true);
+    DrawRichText(dl, modal.reader, ImVec2(x, y - modal.reader_scroll), inner - 16 * s, m, true);
+    dl->PopClipRect();
+    if (max_scroll > 0) {
+      const float bx = r1.x - 2 * s;
+      dl->AddRectFilled(ImVec2(bx, r0.y), ImVec2(bx + 2 * s, r1.y), WithAlpha(color::kText, 0.06f));
+      const float th = std::max(24 * s, reader_h * reader_h / reader_total);
+      const float ty = r0.y + (reader_h - th) * (modal.reader_scroll / max_scroll);
+      dl->AddRectFilled(ImVec2(bx, ty), ImVec2(bx + 2 * s, ty + th), WithAlpha(color::kText, 0.35f));
+    }
+    y += reader_h + 16 * s;
+  }
+
+  // Buttons.
+  const int n = int(modal.buttons.size());
+  if (n > 0) {
+    modal.focus = std::clamp(modal.focus, 0, n - 1);
+    const int focus_before = modal.focus;
+    if (take_input) {
+      const bool reader = !modal.reader.empty();
+      if (in.Pressed(Action::kLeft) || (!reader && in.Pressed(Action::kUp))) modal.focus = std::max(0, modal.focus - 1);
+      if (in.Pressed(Action::kRight) || (!reader && in.Pressed(Action::kDown)))
+        modal.focus = std::min(n - 1, modal.focus + 1);
+    }
+    y += 10 * s;
+    float bx = stacked ? x : p1.x - pad - row_w;
+    int chosen = -1;
+    modal.button_rects.clear();
+    for (int i = 0; i < n; ++i) {
+      const float bwi = stacked ? inner : bw[size_t(i)];
+      const ImVec2 a(bx, y), b(bx + bwi, y + bh);
+      modal.button_rects.emplace_back(a, b);
+      const bool hot = take_input && MouseIn(a, b);
+      if (hot && in.mouse_moved()) modal.focus = i;
+      const bool on = modal.focus == i;
+      if (on) dl->AddRectFilled(a, b, color::kFocus);
+      else dl->AddRect(a, b, WithAlpha(color::kText, hot ? 0.45f : 0.22f));
+      const std::string& label = buttons[size_t(i)];
+      const ImVec2 ls = TextSize(f.semibold, 16 * s, label);
+      dl->AddText(f.semibold, 16 * s, ImVec2(std::round(a.x + (bwi - ls.x) * 0.5f), std::round(a.y + (bh - ls.y) * 0.5f)),
+                  on ? color::kOnFocus : color::kText, label.c_str());
+      if (hot && ImGui::IsMouseClicked(0)) chosen = i;
+      if (stacked) y += bh + 8 * s;
+      else bx += bwi + 10 * s;
+    }
+    if (take_input) {
+      if (in.Pressed(Action::kAccept)) chosen = modal.focus;
+      else if (in.Pressed(Action::kBack) && modal.cancel >= 0) chosen = modal.cancel;
+    }
+    if (chosen >= 0) Cue(chosen == modal.cancel ? Sound::kBack : Sound::kSelect);
+    else if (modal.focus != focus_before) Cue(Sound::kMove);
+    if (chosen >= 0) {
+      // The handler may open another pop-up in this one's place.
+      auto handler = modal.on_button;
+      modal.open = false;
+      if (handler) handler(chosen);
+    }
+  }
+  in.ConsumeAll();  // nothing under the pop-up reacts
+  return true;
+}
+
+}  // namespace kk::ui

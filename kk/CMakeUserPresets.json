@@ -1,0 +1,48 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "user-env",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue-vulkan/win-amd64",
+                "NR_FFX_SDK_DIR": "${sourceDir}/../tools/rexglue-vulkan/fidelityfx"
+            }
+        },
+        {
+            "name": "user-env-vulkan",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue-vulkan/win-amd64",
+                "NR_FFX_SDK_DIR": "${sourceDir}/../tools/rexglue-vulkan/fidelityfx"
+            }
+        },
+        {
+            "name": "user-env-linux",
+            "hidden": true,
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/linux-amd64"
+            }
+        },
+        { "name": "kk-debug",          "inherits": ["win-amd64-debug",          "user-env"] },
+        { "name": "kk-release",        "inherits": ["win-amd64-release",        "user-env"] },
+        { "name": "kk-relwithdebinfo", "inherits": ["win-amd64-relwithdebinfo", "user-env"] },
+        { "name": "kk-linux-release",  "inherits": ["linux-amd64-release",      "user-env-linux"] },
+        { "name": "kk-dev",            "inherits": ["kk-release"], "cacheVariables": { "KK_DEV_TOOLS": "ON" } },
+        { "name": "kk-prof",           "inherits": ["kk-release"], "cacheVariables": { "KK_DEV_TOOLS": "ON", "KK_DEV_PROFILE": "ON" } },
+        { "name": "kk-dev-vulkan",     "inherits": ["win-amd64-release", "user-env-vulkan"], "cacheVariables": { "KK_DEV_TOOLS": "ON" } },
+        { "name": "kk-beta",           "inherits": ["win-amd64-release", "user-env-vulkan"], "cacheVariables": {} },
+        { "name": "kk-stable",         "inherits": ["win-amd64-release", "user-env-vulkan"], "cacheVariables": { "KK_VERSION": "2.0.0", "KK_RELEASE_CHANNEL": "stable" } }
+    ],
+    "buildPresets": [
+        { "name": "kk-debug",          "configurePreset": "kk-debug" },
+        { "name": "kk-release",        "configurePreset": "kk-release" },
+        { "name": "kk-relwithdebinfo", "configurePreset": "kk-relwithdebinfo" },
+        { "name": "kk-linux-release",  "configurePreset": "kk-linux-release" },
+        { "name": "kk-dev",            "configurePreset": "kk-dev" },
+        { "name": "kk-prof",           "configurePreset": "kk-prof" },
+        { "name": "kk-dev-vulkan",     "configurePreset": "kk-dev-vulkan" },
+        { "name": "kk-beta",           "configurePreset": "kk-beta" },
+        { "name": "kk-stable",         "configurePreset": "kk-stable" }
+    ]
+}
